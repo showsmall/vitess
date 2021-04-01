@@ -27,7 +27,7 @@ import (
 	"vitess.io/vitess/go/vt/dbconnpool"
 	"vitess.io/vitess/go/vt/log"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 var (
@@ -49,6 +49,14 @@ func (tm *TabletManager) LockTables(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// We successfully opened a connection. If we return for any reason before
+	// storing this connection in the TabletManager object, we need to close it
+	// to avoid leaking it.
+	defer func() {
+		if tm._lockTablesConnection != conn {
+			conn.Close()
+		}
+	}()
 
 	// FTWRL is preferable, so we'll try that first
 	_, err = conn.ExecuteFetch("FLUSH TABLES WITH READ LOCK", 0, false)
@@ -102,7 +110,7 @@ func (tm *TabletManager) lockTablesUsingLockTables(conn *dbconnpool.DBConnection
 		tableNames = append(tableNames, fmt.Sprintf("%s READ", sqlescape.EscapeID(name)))
 	}
 	lockStatement := fmt.Sprintf("LOCK TABLES %v", strings.Join(tableNames, ", "))
-	_, err := conn.ExecuteFetch(fmt.Sprintf("USE %s", tm.DBConfigs.DBName), 0, false)
+	_, err := conn.ExecuteFetch("USE "+sqlescape.EscapeID(tm.DBConfigs.DBName), 0, false)
 	if err != nil {
 		return err
 	}

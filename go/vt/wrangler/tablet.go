@@ -20,7 +20,8 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
@@ -34,7 +35,7 @@ import (
 // Tablet related methods for wrangler
 
 // InitTablet creates or updates a tablet. If no parent is specified
-// in the tablet, and the tablet has a slave type, we will find the
+// in the tablet, and the tablet has a replica type, we will find the
 // appropriate parent. If createShardAndKeyspace is true and the
 // parent keyspace or shard don't exist, they will be created.  If
 // allowUpdate is true, and a tablet with the same ID exists, just update it.
@@ -150,12 +151,12 @@ func (wr *Wrangler) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.Ta
 	return nil
 }
 
-// ChangeSlaveType changes the type of tablet and recomputes all
+// ChangeTabletType changes the type of tablet and recomputes all
 // necessary derived paths in the serving graph, if necessary.
 //
 // Note we don't update the master record in the Shard here, as we
 // can't ChangeType from and out of master anyway.
-func (wr *Wrangler) ChangeSlaveType(ctx context.Context, tabletAlias *topodatapb.TabletAlias, tabletType topodatapb.TabletType) error {
+func (wr *Wrangler) ChangeTabletType(ctx context.Context, tabletAlias *topodatapb.TabletAlias, tabletType topodatapb.TabletType) error {
 	// Load tablet to find endpoint, and keyspace and shard assignment.
 	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
 	if err != nil {
@@ -163,7 +164,7 @@ func (wr *Wrangler) ChangeSlaveType(ctx context.Context, tabletAlias *topodatapb
 	}
 
 	if !topo.IsTrivialTypeChange(ti.Type, tabletType) {
-		return fmt.Errorf("tablet %v type change %v -> %v is not an allowed transition for ChangeSlaveType", tabletAlias, ti.Type, tabletType)
+		return fmt.Errorf("tablet %v type change %v -> %v is not an allowed transition for ChangeTabletType", tabletAlias, ti.Type, tabletType)
 	}
 
 	// and ask the tablet to make the change
@@ -209,6 +210,15 @@ func (wr *Wrangler) VReplicationExec(ctx context.Context, tabletAlias *topodatap
 	return wr.tmc.VReplicationExec(ctx, ti.Tablet, query)
 }
 
+// GenericVExec executes a query remotely using the DBA pool
+func (wr *Wrangler) GenericVExec(ctx context.Context, tabletAlias *topodatapb.TabletAlias, query, workflow, keyspace string) (*querypb.QueryResult, error) {
+	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
+	if err != nil {
+		return nil, err
+	}
+	return wr.tmc.VExec(ctx, ti.Tablet, query, workflow, keyspace)
+}
+
 // isMasterTablet is a shortcut way to determine whether the current tablet
 // is a master before we allow its tablet record to be deleted. The canonical
 // way to determine the only true master in a shard is to list all the tablets
@@ -220,22 +230,5 @@ func (wr *Wrangler) VReplicationExec(ctx context.Context, tabletAlias *topodatap
 // the system is in transition (a reparenting event is in progress and parts of
 // the topo have not yet been updated).
 func (wr *Wrangler) isMasterTablet(ctx context.Context, ti *topo.TabletInfo) (bool, error) {
-	// Tablet record claims to be non-master, we believe it
-	if ti.Type != topodatapb.TabletType_MASTER {
-		return false, nil
-	}
-	si, err := wr.ts.GetShard(ctx, ti.Keyspace, ti.Shard)
-	if err != nil {
-		// strictly speaking it isn't correct to return false here, the tablet status is unknown
-		return false, err
-	}
-	// Tablet record claims to be master, and shard record matches
-	if topoproto.TabletAliasEqual(si.MasterAlias, ti.Tablet.Alias) {
-		return true, nil
-	}
-	// Shard record has another tablet as master, so check MasterTermStartTime
-	// If tablet record's MasterTermStartTime is later than the one in the shard record, then tablet is master
-	tabletMTST := ti.GetMasterTermStartTime()
-	shardMTST := si.GetMasterTermStartTime()
-	return tabletMTST.After(shardMTST), nil
+	return topotools.IsPrimaryTablet(ctx, wr.TopoServer(), ti)
 }

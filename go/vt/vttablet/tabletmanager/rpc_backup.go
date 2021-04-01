@@ -20,7 +20,8 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -84,9 +85,19 @@ func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger log
 		}
 		originalType = tablet.Type
 		// update our type to BACKUP
-		if err := tm.changeTypeLocked(ctx, topodatapb.TabletType_BACKUP); err != nil {
+		if err := tm.changeTypeLocked(ctx, topodatapb.TabletType_BACKUP, DBActionNone); err != nil {
 			return err
 		}
+		// Tell Orchestrator we're stopped on purpose for some Vitess task.
+		// Do this in the background, as it's best-effort.
+		go func() {
+			if tm.orc == nil {
+				return
+			}
+			if err := tm.orc.BeginMaintenance(tm.Tablet(), "vttablet has been told to run an offline backup"); err != nil {
+				logger.Warningf("Orchestrator BeginMaintenance failed: %v", err)
+			}
+		}()
 	}
 	// create the loggers: tee to console and source
 	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
@@ -115,13 +126,24 @@ func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger log
 
 		// Change our type back to the original value.
 		// Original type could be master so pass in a real value for masterTermStartTime
-		if err := tm.changeTypeLocked(bgCtx, originalType); err != nil {
+		if err := tm.changeTypeLocked(bgCtx, originalType, DBActionNone); err != nil {
 			// failure in changing the topology type is probably worse,
 			// so returning that (we logged the snapshot error anyway)
 			if returnErr != nil {
 				l.Errorf("mysql backup command returned error: %v", returnErr)
 			}
 			returnErr = err
+		} else {
+			// Tell Orchestrator we're no longer stopped on purpose.
+			// Do this in the background, as it's best-effort.
+			go func() {
+				if tm.orc == nil {
+					return
+				}
+				if err := tm.orc.EndMaintenance(tm.Tablet()); err != nil {
+					logger.Warningf("Orchestrator EndMaintenance failed: %v", err)
+				}
+			}()
 		}
 	}
 
@@ -150,7 +172,7 @@ func (tm *TabletManager) RestoreFromBackup(ctx context.Context, logger logutil.L
 	err = tm.restoreDataLocked(ctx, l, 0 /* waitForBackupInterval */, true /* deleteBeforeRestore */)
 
 	// re-run health check to be sure to capture any replication delay
-	tm.runHealthCheckLocked()
+	tm.QueryServiceControl.BroadcastHealth()
 
 	return err
 }

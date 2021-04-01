@@ -26,8 +26,9 @@ import (
 	"strconv"
 	"strings"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
@@ -388,7 +389,7 @@ func initTasks(tasks map[string]*workflowpb.Task, phase workflow.PhaseType, shar
 // control the horizontal resharding workflow.
 type horizontalReshardingWorkflow struct {
 	ctx        context.Context
-	wr         ReshardingWrangler
+	wr         Wrangler
 	manager    *workflow.Manager
 	topoServer *topo.Server
 	wi         *topo.WorkflowInfo
@@ -416,7 +417,7 @@ func (hw *horizontalReshardingWorkflow) Run(ctx context.Context, manager *workfl
 	if err := hw.runWorkflow(); err != nil {
 		return err
 	}
-	hw.setUIMessage(fmt.Sprintf("Horizontal Resharding is finished successfully."))
+	hw.setUIMessage(fmt.Sprintf("Horizontal Resharding is finished successfully.")) //nolint
 	return nil
 }
 

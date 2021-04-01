@@ -20,7 +20,7 @@ import (
 	"flag"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/vt/log"
@@ -32,11 +32,11 @@ import (
 )
 
 var (
-	schemaChangeDir           = flag.String("schema_change_dir", "", "directory contains schema changes for all keyspaces. Each keyspace has its own directory and schema changes are expected to live in '$KEYSPACE/input' dir. e.g. test_keyspace/input/*sql, each sql file represents a schema change")
-	schemaChangeController    = flag.String("schema_change_controller", "", "schema change controller is responsible for finding schema changes and responding to schema change events")
-	schemaChangeCheckInterval = flag.Int("schema_change_check_interval", 60, "this value decides how often we check schema change dir, in seconds")
-	schemaChangeUser          = flag.String("schema_change_user", "", "The user who submits this schema change.")
-	schemaChangeSlaveTimeout  = flag.Duration("schema_change_slave_timeout", 10*time.Second, "how long to wait for replicas to receive the schema change")
+	schemaChangeDir             = flag.String("schema_change_dir", "", "directory contains schema changes for all keyspaces. Each keyspace has its own directory and schema changes are expected to live in '$KEYSPACE/input' dir. e.g. test_keyspace/input/*sql, each sql file represents a schema change")
+	schemaChangeController      = flag.String("schema_change_controller", "", "schema change controller is responsible for finding schema changes and responding to schema change events")
+	schemaChangeCheckInterval   = flag.Int("schema_change_check_interval", 60, "this value decides how often we check schema change dir, in seconds")
+	schemaChangeUser            = flag.String("schema_change_user", "", "The user who submits this schema change.")
+	schemaChangeReplicasTimeout = flag.Duration("schema_change_replicas_timeout", wrangler.DefaultWaitReplicasTimeout, "how long to wait for replicas to receive the schema change")
 )
 
 func initSchema() {
@@ -67,7 +67,7 @@ func initSchema() {
 			err = schemamanager.Run(
 				ctx,
 				controller,
-				schemamanager.NewTabletExecutor(wr, *schemaChangeSlaveTimeout),
+				schemamanager.NewTabletExecutor("vtctld/schema", wr, *schemaChangeReplicasTimeout),
 			)
 			if err != nil {
 				log.Errorf("Schema change failed, error: %v", err)

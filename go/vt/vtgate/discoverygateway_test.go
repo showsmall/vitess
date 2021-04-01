@@ -18,33 +18,32 @@ package vtgate
 
 import (
 	"fmt"
-	"strings"
 	"testing"
+	"time"
 
 	"vitess.io/vitess/go/vt/log"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/srvtopo/srvtopotest"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/topotools"
-	"vitess.io/vitess/go/vt/vterrors"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/topodata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 func TestDiscoveryGatewayExecute(t *testing.T) {
 	testDiscoveryGatewayGeneric(t, func(dg *DiscoveryGateway, target *querypb.Target) error {
-		_, err := dg.Execute(context.Background(), target, "query", nil, 0, nil)
+		_, err := dg.Execute(context.Background(), target, "query", nil, 0, 0, nil)
 		return err
 	})
 	testDiscoveryGatewayTransact(t, func(dg *DiscoveryGateway, target *querypb.Target) error {
-		_, err := dg.Execute(context.Background(), target, "query", nil, 1, nil)
+		_, err := dg.Execute(context.Background(), target, "query", nil, 1, 0, nil)
 		return err
 	})
 }
@@ -80,19 +79,21 @@ func TestDiscoveryGatewayBegin(t *testing.T) {
 
 func TestDiscoveryGatewayCommit(t *testing.T) {
 	testDiscoveryGatewayTransact(t, func(dg *DiscoveryGateway, target *querypb.Target) error {
-		return dg.Commit(context.Background(), target, 1)
+		_, err := dg.Commit(context.Background(), target, 1)
+		return err
 	})
 }
 
 func TestDiscoveryGatewayRollback(t *testing.T) {
 	testDiscoveryGatewayTransact(t, func(dg *DiscoveryGateway, target *querypb.Target) error {
-		return dg.Rollback(context.Background(), target, 1)
+		_, err := dg.Rollback(context.Background(), target, 1)
+		return err
 	})
 }
 
 func TestDiscoveryGatewayBeginExecute(t *testing.T) {
 	testDiscoveryGatewayGeneric(t, func(dg *DiscoveryGateway, target *querypb.Target) error {
-		_, _, _, err := dg.BeginExecute(context.Background(), target, "query", nil, nil)
+		_, _, _, err := dg.BeginExecute(context.Background(), target, nil, "query", nil, 0, nil)
 		return err
 	})
 }
@@ -130,6 +131,87 @@ func TestDiscoveryGatewayGetTablets(t *testing.T) {
 	if len(tsl) != 1 || !topo.TabletEquality(tsl[0].Tablet, ep1) {
 		t.Errorf("want %+v, got %+v", ep1, tsl)
 	}
+}
+
+func TestDiscoveryGatewayWaitForTablets(t *testing.T) {
+	keyspace := "ks"
+	shard := "0"
+	cell := "local"
+	hc := discovery.NewFakeLegacyHealthCheck()
+	ts := memorytopo.NewServer("local")
+	srvTopo := srvtopotest.NewPassthroughSrvTopoServer()
+	srvTopo.TopoServer = ts
+	srvTopo.SrvKeyspaceNames = []string{keyspace}
+	srvTopo.SrvKeyspace = &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodata.TabletType_MASTER,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name: shard,
+					},
+				},
+			},
+			{
+				ServedType: topodata.TabletType_REPLICA,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name: shard,
+					},
+				},
+			},
+			{
+				ServedType: topodata.TabletType_RDONLY,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name: shard,
+					},
+				},
+			},
+		},
+	}
+	dg := NewDiscoveryGateway(context.Background(), hc, srvTopo, "local", 2)
+
+	// replica should only use local ones
+	hc.Reset()
+	dg.tsc.ResetForTesting()
+	hc.AddTestTablet(cell, "2.2.2.2", 1001, keyspace, shard, topodatapb.TabletType_REPLICA, true, 10, nil)
+	hc.AddTestTablet(cell, "1.1.1.1", 1001, keyspace, shard, topodatapb.TabletType_MASTER, true, 5, nil)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second) //nolint
+		defer cancel()
+		err := dg.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_REPLICA, topodatapb.TabletType_MASTER})
+		if err != nil {
+			t.Errorf("want %+v, got %+v", nil, err)
+		}
+
+		// fails if there are no available tablets for the desired TabletType
+		err = dg.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_RDONLY})
+		if err == nil {
+			t.Errorf("expected error, got nil")
+		}
+	}
+	{
+		// errors because there is no primary on  ks2
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second) //nolint
+		defer cancel()
+		srvTopo.SrvKeyspaceNames = []string{keyspace, "ks2"}
+		err := dg.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_MASTER})
+		if err == nil {
+			t.Errorf("expected error, got nil")
+		}
+	}
+	discovery.KeyspacesToWatch = []string{keyspace}
+	// does not wait for ks2 if it's not part of the filter
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second) //nolint
+		defer cancel()
+		err := dg.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_MASTER})
+		if err != nil {
+			t.Errorf("want %+v, got %+v", nil, err)
+		}
+	}
+	discovery.KeyspacesToWatch = []string{}
 }
 
 func TestShuffleTablets(t *testing.T) {
@@ -283,7 +365,7 @@ func testDiscoveryGatewayGeneric(t *testing.T, f func(dg *DiscoveryGateway, targ
 	// no tablet
 	hc.Reset()
 	dg.tsc.ResetForTesting()
-	want := []string{"target: ks.0.replica", "no valid tablet"}
+	want := []string{"target: ks.0.replica", `no healthy tablet available for 'keyspace:"ks" shard:"0" tablet_type:REPLICA`}
 	err := f(dg, target)
 	verifyShardErrors(t, err, want, vtrpcpb.Code_UNAVAILABLE)
 
@@ -308,14 +390,9 @@ func testDiscoveryGatewayGeneric(t *testing.T, f func(dg *DiscoveryGateway, targ
 	sc2 := hc.AddTestTablet("cell", "1.1.1.1", 1002, keyspace, shard, tabletType, true, 10, nil)
 	sc1.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
 	sc2.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
-	ep1 := sc1.Tablet()
-	ep2 := sc2.Tablet()
 
 	err = f(dg, target)
 	verifyContainsError(t, err, "target: ks.0.replica", vtrpcpb.Code_FAILED_PRECONDITION)
-	verifyShardErrorEither(t, err,
-		fmt.Sprintf(`used tablet: %s`, topotools.TabletIdent(ep1)),
-		fmt.Sprintf(`used tablet: %s`, topotools.TabletIdent(ep2)))
 
 	// fatal error
 	hc.Reset()
@@ -324,22 +401,16 @@ func testDiscoveryGatewayGeneric(t *testing.T, f func(dg *DiscoveryGateway, targ
 	sc2 = hc.AddTestTablet("cell", "1.1.1.1", 1002, keyspace, shard, tabletType, true, 10, nil)
 	sc1.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
 	sc2.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
-	ep1 = sc1.Tablet()
-	ep2 = sc2.Tablet()
 	err = f(dg, target)
 	verifyContainsError(t, err, "target: ks.0.replica", vtrpcpb.Code_FAILED_PRECONDITION)
-	verifyShardErrorEither(t, err,
-		fmt.Sprintf(`used tablet: %s`, topotools.TabletIdent(ep1)),
-		fmt.Sprintf(`used tablet: %s`, topotools.TabletIdent(ep2)))
 
 	// server error - no retry
 	hc.Reset()
 	dg.tsc.ResetForTesting()
 	sc1 = hc.AddTestTablet("cell", "1.1.1.1", 1001, keyspace, shard, tabletType, true, 10, nil)
 	sc1.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
-	ep1 = sc1.Tablet()
 	err = f(dg, target)
-	verifyContainsError(t, err, fmt.Sprintf(`used tablet: %s`, topotools.TabletIdent(ep1)), vtrpcpb.Code_INVALID_ARGUMENT)
+	verifyContainsError(t, err, "target: ks.0.replica", vtrpcpb.Code_INVALID_ARGUMENT)
 
 	// no failure
 	hc.Reset()
@@ -370,51 +441,15 @@ func testDiscoveryGatewayTransact(t *testing.T, f func(dg *DiscoveryGateway, tar
 	sc2 := hc.AddTestTablet("cell", "1.1.1.1", 1002, keyspace, shard, tabletType, true, 10, nil)
 	sc1.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
 	sc2.MustFailCodes[vtrpcpb.Code_FAILED_PRECONDITION] = 1
-	ep1 := sc1.Tablet()
-	ep2 := sc2.Tablet()
 
 	err := f(dg, target)
 	verifyContainsError(t, err, "target: ks.0.replica", vtrpcpb.Code_FAILED_PRECONDITION)
-	format := `used tablet: %s`
-	verifyShardErrorEither(t, err,
-		fmt.Sprintf(format, topotools.TabletIdent(ep1)),
-		fmt.Sprintf(format, topotools.TabletIdent(ep2)))
 
 	// server error - no retry
 	hc.Reset()
 	dg.tsc.ResetForTesting()
 	sc1 = hc.AddTestTablet("cell", "1.1.1.1", 1001, keyspace, shard, tabletType, true, 10, nil)
 	sc1.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
-	ep1 = sc1.Tablet()
 	err = f(dg, target)
 	verifyContainsError(t, err, "target: ks.0.replica", vtrpcpb.Code_INVALID_ARGUMENT)
-	verifyContainsError(t, err, fmt.Sprintf(format, topotools.TabletIdent(ep1)), vtrpcpb.Code_INVALID_ARGUMENT)
-}
-
-func verifyContainsError(t *testing.T, err error, wantErr string, wantCode vtrpcpb.Code) {
-	if err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Fatalf("wanted error: \n%s\n, got error: \n%v\n", wantErr, err)
-	}
-	if code := vterrors.Code(err); code != wantCode {
-		t.Fatalf("wanted error code: %s, got: %v", wantCode, code)
-	}
-}
-
-func verifyShardErrorEither(t *testing.T, err error, a, b string) {
-	if err == nil || !strings.Contains(err.Error(), a) || !strings.Contains(err.Error(), b) {
-		t.Fatalf("wanted error to contain: %v or %v\n, got error: %v", a, b, err)
-	}
-}
-
-func verifyShardErrors(t *testing.T, err error, wantErrors []string, wantCode vtrpcpb.Code) {
-	if err != nil {
-		for _, wantErr := range wantErrors {
-			if err == nil || !strings.Contains(err.Error(), wantErr) {
-				t.Fatalf("wanted error: \n%s\n, got error: \n%v\n", wantErr, err)
-			}
-		}
-	}
-	if code := vterrors.Code(err); code != wantCode {
-		t.Fatalf("wanted error code: %s, got: %v", wantCode, code)
-	}
 }

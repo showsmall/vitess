@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
+
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -39,7 +40,11 @@ func TestDisabledThrottler(t *testing.T) {
 	config := tabletenv.NewDefaultConfig()
 	config.EnableTxThrottler = false
 	throttler := NewTxThrottler(config, nil)
-	if err := throttler.Open("keyspace", "shard"); err != nil {
+	throttler.InitDBConfig(querypb.Target{
+		Keyspace: "keyspace",
+		Shard:    "shard",
+	})
+	if err := throttler.Open(); err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
 	if result := throttler.Throttle(); result != false {
@@ -117,7 +122,11 @@ func TestEnabledThrottler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
-	if err := throttler.Open("keyspace", "shard"); err != nil {
+	throttler.InitDBConfig(querypb.Target{
+		Keyspace: "keyspace",
+		Shard:    "shard",
+	})
+	if err := throttler.Open(); err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
 	if result := throttler.Throttle(); result != false {

@@ -17,7 +17,9 @@ limitations under the License.
 package tabletmanager
 
 import (
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
 
@@ -44,7 +46,7 @@ func (tm *TabletManager) ExecuteFetchAsDba(ctx context.Context, query []byte, db
 	if dbName != "" {
 		// This execute might fail if db does not exist.
 		// Error is ignored because given query might create this database.
-		conn.ExecuteFetch("USE "+dbName, 1, false)
+		conn.ExecuteFetch("USE "+sqlescape.EscapeID(dbName), 1, false)
 	}
 
 	// run the query
@@ -81,7 +83,7 @@ func (tm *TabletManager) ExecuteFetchAsAllPrivs(ctx context.Context, query []byt
 	if dbName != "" {
 		// This execute might fail if db does not exist.
 		// Error is ignored because given query might create this database.
-		conn.ExecuteFetch("USE "+dbName, 1, false)
+		conn.ExecuteFetch("USE "+sqlescape.EscapeID(dbName), 1, false)
 	}
 
 	// run the query

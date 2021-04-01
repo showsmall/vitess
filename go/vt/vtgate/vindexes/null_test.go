@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
@@ -51,9 +52,13 @@ func TestNullMap(t *testing.T) {
 		sqltypes.NewInt64(4),
 		sqltypes.NewInt64(5),
 		sqltypes.NewInt64(6),
+		sqltypes.NewVarChar("1234567890123"),
+		sqltypes.NULL,
 	})
 	require.NoError(t, err)
 	want := []key.Destination{
+		key.DestinationKeyspaceID([]byte{0}),
+		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
@@ -75,6 +80,6 @@ func TestNullVerify(t *testing.T) {
 	}
 	want := []bool{true, false}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("binaryMD5.Verify: %v, want %v", got, want)
+		t.Errorf("null.Verify: %v, want %v", got, want)
 	}
 }

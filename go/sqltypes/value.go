@@ -20,8 +20,10 @@ package sqltypes
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"vitess.io/vitess/go/bytes2"
 	"vitess.io/vitess/go/hack"
@@ -37,6 +39,9 @@ var (
 	DontEscape = byte(255)
 
 	nullstr = []byte("null")
+
+	// ErrIncompatibleTypeCast indicates a casting problem
+	ErrIncompatibleTypeCast = errors.New("Cannot convert value to desired type")
 )
 
 // BinWriter interface is used for encoding values.
@@ -203,6 +208,48 @@ func (v Value) Len() int {
 	return len(v.val)
 }
 
+// ToInt64 returns the value as MySQL would return it as a int64.
+func (v Value) ToInt64() (int64, error) {
+	if !v.IsIntegral() {
+		return 0, ErrIncompatibleTypeCast
+	}
+
+	return strconv.ParseInt(v.ToString(), 10, 64)
+}
+
+// ToFloat64 returns the value as MySQL would return it as a float64.
+func (v Value) ToFloat64() (float64, error) {
+	if !IsNumber(v.typ) {
+		return 0, ErrIncompatibleTypeCast
+	}
+
+	return strconv.ParseFloat(v.ToString(), 64)
+}
+
+// ToUint64 returns the value as MySQL would return it as a uint64.
+func (v Value) ToUint64() (uint64, error) {
+	if !v.IsIntegral() {
+		return 0, ErrIncompatibleTypeCast
+	}
+
+	return strconv.ParseUint(v.ToString(), 10, 64)
+}
+
+// ToBool returns the value as a bool value
+func (v Value) ToBool() (bool, error) {
+	i, err := v.ToInt64()
+	if err != nil {
+		return false, err
+	}
+	switch i {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	}
+	return false, ErrIncompatibleTypeCast
+}
+
 // ToString returns the value as MySQL would return it as string.
 // If the value is not convertible like in the case of Expression, it returns nil.
 func (v Value) ToString() string {
@@ -289,6 +336,12 @@ func (v Value) IsBinary() bool {
 	return IsBinary(v.typ)
 }
 
+// IsDateTime returns true if Value is datetime.
+func (v Value) IsDateTime() bool {
+	dt := int(querypb.Type_DATETIME)
+	return int(v.typ)&dt == dt
+}
+
 // MarshalJSON should only be used for testing.
 // It's not a complete implementation.
 func (v Value) MarshalJSON() ([]byte, error) {
@@ -345,6 +398,27 @@ func encodeBytesSQL(val []byte, b BinWriter) {
 	}
 	buf.WriteByte('\'')
 	b.Write(buf.Bytes())
+}
+
+// BufEncodeStringSQL encodes the string into a strings.Builder
+func BufEncodeStringSQL(buf *strings.Builder, val string) {
+	buf.WriteByte('\'')
+	for _, ch := range val {
+		if encodedChar := SQLEncodeMap[ch]; encodedChar == DontEscape {
+			buf.WriteByte(byte(ch))
+		} else {
+			buf.WriteByte('\\')
+			buf.WriteByte(encodedChar)
+		}
+	}
+	buf.WriteByte('\'')
+}
+
+// EncodeStringSQL encodes the string as a SQL string.
+func EncodeStringSQL(val string) string {
+	var buf strings.Builder
+	BufEncodeStringSQL(&buf, val)
+	return buf.String()
 }
 
 func encodeBytesSQLBits(val []byte, b BinWriter) {

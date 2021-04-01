@@ -20,8 +20,9 @@ import (
 	"fmt"
 	"path"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -72,6 +73,28 @@ func (ts *Server) GetCellsAliases(ctx context.Context, strongRead bool) (ret map
 	default:
 		return nil, err
 	}
+}
+
+// GetCellsAlias returns the CellsAlias that matches the given name.
+func (ts *Server) GetCellsAlias(ctx context.Context, name string, strongRead bool) (*topodatapb.CellsAlias, error) {
+	conn := ts.globalCell
+	if !strongRead {
+		conn = ts.globalReadOnlyCell
+	}
+
+	aliasPath := pathForCellsAlias(name)
+	contents, _, err := conn.Get(ctx, aliasPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unpack the contents.
+	cellsAlias := &topodatapb.CellsAlias{}
+	if err := proto.Unmarshal(contents, cellsAlias); err != nil {
+		return nil, err
+	}
+
+	return cellsAlias, nil
 }
 
 // DeleteCellsAlias deletes the specified CellsAlias

@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -87,7 +87,7 @@ type ShardResult struct {
 	Shard  string
 	Result *querypb.QueryResult
 	// Position is a replication position that is guaranteed to be after the
-	// schema change was applied. It can be used to wait for slaves to receive
+	// schema change was applied. It can be used to wait for replicas to receive
 	// the schema change via replication.
 	Position string
 }

@@ -200,6 +200,10 @@ message BinlogSource {
   // StopAfterCopy specifies if vreplication should be stopped
   // after copying is done.
   bool stop_after_copy = 9;
+
+  // ExternalCluster is the name of the mounted cluster which has the source keyspace/db for this workflow
+  // it is of the type <cluster_type.cluster_name>
+  string external_cluster = 10;
 }
 
 // VEventType enumerates the event types. Many of these types
@@ -232,6 +236,7 @@ enum VEventType {
   JOURNAL = 16;
   VERSION = 17;
   LASTPK = 18;
+  SAVEPOINT = 19;
 }
 
 // RowChange represents one row change.
@@ -327,8 +332,8 @@ message VEvent {
   int64 timestamp = 2;
   // Gtid is set if the event type is GTID.
   string gtid = 3;
-  // Ddl is set if the event type is DDL.
-  string ddl = 4;
+  // Statement is set if the event type is DDL, DML or SAVEPOINT.
+  string statement = 4;
   // RowEvent is set if the event type is ROW.
   RowEvent row_event = 5;
   // FieldEvent is set if the event type is FIELD.

@@ -19,8 +19,10 @@ package srvtopo
 import (
 	"sort"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -246,4 +248,9 @@ func ValuesEqual(vss1, vss2 [][]*querypb.Value) bool {
 		}
 	}
 	return true
+}
+
+// GetGateway returns the used gateway
+func (r *Resolver) GetGateway() Gateway {
+	return r.gateway
 }

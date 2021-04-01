@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+
 	"vitess.io/vitess/go/trace"
 
 	"vitess.io/vitess/go/vt/grpccommon"
@@ -62,7 +63,7 @@ func Dial(target string, failFast FailFast, opts ...grpc.DialOption) (*grpc.Clie
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(*grpccommon.MaxMessageSize),
 			grpc.MaxCallSendMsgSize(*grpccommon.MaxMessageSize),
-			grpc.FailFast(bool(failFast)),
+			grpc.WaitForReady(bool(!failFast)),
 		),
 	}
 

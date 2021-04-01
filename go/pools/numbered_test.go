@@ -21,48 +21,48 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNumbered(t *testing.T) {
+func TestNumberedGeneral(t *testing.T) {
 	id := int64(0)
 	p := NewNumbered()
 
-	var err error
-	if err = p.Register(id, id, true); err != nil {
-		t.Errorf("Error %v", err)
-	}
-	if err = p.Register(id, id, true); err.Error() != "already present" {
-		t.Errorf("want 'already present', got '%v'", err)
-	}
+	err := p.Register(id, id, true)
+	require.NoError(t, err)
+
+	err = p.Register(id, id, true)
+	assert.Contains(t, "already present", err.Error())
+
 	var v interface{}
-	if v, err = p.Get(id, "test"); err != nil {
-		t.Errorf("Error %v", err)
-	}
-	if v.(int64) != id {
-		t.Errorf("want %v, got %v", id, v.(int64))
-	}
-	if _, err = p.Get(id, "test1"); err.Error() != "in use: test" {
-		t.Errorf("want 'in use: test', got '%v'", err)
-	}
-	p.Put(id)
-	if _, err = p.Get(1, "test2"); err.Error() != "not found" {
-		t.Errorf("want 'not found', got '%v'", err)
-	}
+	v, err = p.Get(id, "test")
+	require.NoError(t, err)
+	assert.Equal(t, id, v.(int64))
+
+	_, err = p.Get(id, "test1")
+	assert.Contains(t, "in use: test", err.Error())
+
+	p.Put(id, true)
+	_, err = p.Get(1, "test2")
+	assert.Contains(t, "not found", err.Error())
 	p.Unregister(1, "test") // Should not fail
 	p.Unregister(0, "test")
 	// p is now empty
 
 	if _, err = p.Get(0, "test3"); !(strings.HasPrefix(err.Error(), "ended at") && strings.HasSuffix(err.Error(), "(test)")) {
-		t.Errorf("want prefix 'ended at' and suffix '(test'), got '%v'", err)
+		t.Errorf("want prefix 'ended at' and suffix '(test)', got '%v'", err)
 	}
 
+	id = 0
 	p.Register(id, id, true)
-	id++
+	id = 1
 	p.Register(id, id, true)
-	id++
+	id = 2
 	p.Register(id, id, false)
 	time.Sleep(300 * time.Millisecond)
-	id++
+	id = 3
 	p.Register(id, id, true)
 	time.Sleep(100 * time.Millisecond)
 
@@ -75,9 +75,9 @@ func TestNumbered(t *testing.T) {
 		t.Errorf("want 'in use: by outdated', got '%v'", err)
 	}
 	for _, v := range vals {
-		p.Put(v.(int64))
+		p.Put(v.(int64), true)
 	}
-	p.Put(2) // put to 2 to ensure it's not idle
+	p.Put(2, true) // put to 2 to ensure it's not idle
 	time.Sleep(100 * time.Millisecond)
 
 	// p has 0, 1, 2 (2 is idle)
@@ -103,6 +103,20 @@ func TestNumbered(t *testing.T) {
 		p.Unregister(2, "test")
 	}()
 	p.WaitForEmpty()
+}
+
+func TestNumberedGetByFilter(t *testing.T) {
+	p := NewNumbered()
+	p.Register(1, 1, true)
+	p.Register(2, 2, true)
+	p.Register(3, 3, true)
+	p.Get(1, "locked")
+
+	vals := p.GetByFilter("filtered", func(v interface{}) bool {
+		return v.(int) <= 2
+	})
+	want := []interface{}{2}
+	assert.Equal(t, want, vals)
 }
 
 /*

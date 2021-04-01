@@ -25,7 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
@@ -55,6 +56,7 @@ func TestQuerylogzHandler(t *testing.T) {
 	logStats.MysqlResponseTime = 1 * time.Millisecond
 	logStats.WaitingForConnection = 10 * time.Nanosecond
 	logStats.TransactionID = 131
+	logStats.ReservedID = 313
 	logStats.Ctx = callerid.NewContext(
 		context.Background(),
 		callerid.NewEffectiveCallerID("effective-caller", "component", "subcomponent"),
@@ -80,6 +82,7 @@ func TestQuerylogzHandler(t *testing.T) {
 		`<td>1000</td>`,
 		`<td>0</td>`,
 		`<td>131</td>`,
+		`<td>313</td>`,
 		`<td></td>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(1 * time.Millisecond)
@@ -110,6 +113,7 @@ func TestQuerylogzHandler(t *testing.T) {
 		`<td>1000</td>`,
 		`<td>0</td>`,
 		`<td>131</td>`,
+		`<td>313</td>`,
 		`<td></td>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(20 * time.Millisecond)
@@ -140,6 +144,7 @@ func TestQuerylogzHandler(t *testing.T) {
 		`<td>1000</td>`,
 		`<td>0</td>`,
 		`<td>131</td>`,
+		`<td>313</td>`,
 		`<td></td>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(500 * time.Millisecond)

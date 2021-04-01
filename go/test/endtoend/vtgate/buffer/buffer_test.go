@@ -47,6 +47,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -73,7 +74,7 @@ const (
 	demoteMasterQuery          = "SET GLOBAL read_only = ON;FLUSH TABLES WITH READ LOCK;UNLOCK TABLES;"
 	disableSemiSyncMasterQuery = "SET GLOBAL rpl_semi_sync_master_enabled = 0"
 	enableSemiSyncMasterQuery  = "SET GLOBAL rpl_semi_sync_master_enabled = 1"
-	promoteSlaveQuery          = "STOP SLAVE;RESET SLAVE ALL;SET GLOBAL read_only = OFF;"
+	promoteQuery               = "STOP SLAVE;RESET SLAVE ALL;SET GLOBAL read_only = OFF;"
 )
 
 //threadParams is set of params passed into read and write threads
@@ -205,7 +206,9 @@ func createCluster() (*cluster.LocalProcessCluster, int) {
 		// Long timeout in case failover is slow.
 		"-buffer_window", "10m",
 		"-buffer_max_failover_duration", "10m",
-		"-buffer_min_time_between_failovers", "20m"}
+		"-buffer_min_time_between_failovers", "20m",
+		// Use legacy gateway. tabletgateway test is at go/test/endtoend/tabletgateway/buffer/buffer_test.go
+		"-gateway_implementation", "discoverygateway"}
 
 	// Start vtgate
 	if err := clusterInstance.StartVtgate(); err != nil {
@@ -379,8 +382,8 @@ func externalReparenting(ctx context.Context, t *testing.T, clusterInstance *clu
 	}
 
 	//Promote replica to new master and log error
-	if _, err := replica.VttabletProcess.QueryTablet(promoteSlaveQuery, keyspaceUnshardedName, true); err != nil {
-		log.Errorf("replica.VttabletProcess.QueryTablet(promoteSlaveQuery... caused an error : %v", err)
+	if _, err := replica.VttabletProcess.QueryTablet(promoteQuery, keyspaceUnshardedName, true); err != nil {
+		log.Errorf("replica.VttabletProcess.QueryTablet(promoteQuery... caused an error : %v", err)
 	}
 
 	if replica.VttabletProcess.EnableSemiSync {

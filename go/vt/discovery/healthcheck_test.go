@@ -34,19 +34,25 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/status"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
+	"vitess.io/vitess/go/vt/proto/query"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
+
+var connMap map[string]*fakeConn
+var connMapMu sync.Mutex
 
 func init() {
 	tabletconn.RegisterDialer("fake_gateway", tabletDialer)
@@ -55,17 +61,17 @@ func init() {
 	if err := flag.Set("tablet_protocol", "fake_gateway"); err != nil {
 		log.Errorf("failed to set flag \"tablet_protocol\" to \"fake_gateway\":%v", err)
 	}
+	connMap = make(map[string]*fakeConn)
 }
 
 func TestHealthCheck(t *testing.T) {
+	// reset error counters
+	hcErrorCounters.ResetAll()
 	ts := memorytopo.NewServer("cell")
 	hc := createTestHc(ts)
 	// close healthcheck
 	defer hc.Close()
-	tablet := topo.NewTablet(0, "cell", "a")
-	tablet.Keyspace = "k"
-	tablet.Shard = "s"
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	tablet.Type = topodatapb.TabletType_REPLICA
 	input := make(chan *querypb.StreamHealthResponse)
 	conn := createFakeConn(tablet, input)
@@ -88,9 +94,10 @@ func TestHealthCheck(t *testing.T) {
 	mustMatch(t, want, result, "Wrong TabletHealth data")
 
 	shr := &querypb.StreamHealthResponse{
-		TabletAlias:                         tablet.Alias,
-		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
-		Serving:                             true,
+		TabletAlias: tablet.Alias,
+		Target:      &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:     true,
+
 		TabletExternallyReparentedTimestamp: 0,
 		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.5},
 	}
@@ -203,8 +210,7 @@ func TestHealthCheckStreamError(t *testing.T) {
 	hc := createTestHc(ts)
 	defer hc.Close()
 
-	tablet := topo.NewTablet(0, "cell", "a")
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse)
 	resultChan := hc.Subscribe()
 	fc := createFakeConn(tablet, input)
@@ -214,7 +220,7 @@ func TestHealthCheckStreamError(t *testing.T) {
 	// Immediately after AddTablet() there will be the first notification.
 	want := &TabletHealth{
 		Tablet:              tablet,
-		Target:              &querypb.Target{},
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s"},
 		Serving:             false,
 		MasterTermStartTime: 0,
 	}
@@ -253,6 +259,69 @@ func TestHealthCheckStreamError(t *testing.T) {
 	result = <-resultChan
 	//TODO: figure out how to compare objects that contain errors using utils.MustMatch
 	assert.True(t, want.DeepEqual(result), "Wrong TabletHealth data\n Expected: %v\n Actual:   %v", want, result)
+	// tablet should be removed from healthy list
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
+	assert.Empty(t, a, "wrong result, expected empty list")
+}
+
+// TestHealthCheckErrorOnPrimary is the same as TestHealthCheckStreamError except for tablet type
+func TestHealthCheckErrorOnPrimary(t *testing.T) {
+	ts := memorytopo.NewServer("cell")
+	hc := createTestHc(ts)
+	defer hc.Close()
+
+	tablet := createTestTablet(0, "cell", "a")
+	input := make(chan *querypb.StreamHealthResponse)
+	resultChan := hc.Subscribe()
+	fc := createFakeConn(tablet, input)
+	fc.errCh = make(chan error)
+	hc.AddTablet(tablet)
+
+	// Immediately after AddTablet() there will be the first notification.
+	want := &TabletHealth{
+		Tablet:              tablet,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s"},
+		Serving:             false,
+		MasterTermStartTime: 0,
+	}
+	result := <-resultChan
+	mustMatch(t, want, result, "Wrong TabletHealth data")
+
+	// one tablet after receiving a StreamHealthResponse
+	shr := &querypb.StreamHealthResponse{
+		TabletAlias:                         tablet.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 10,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+	}
+	want = &TabletHealth{
+		Tablet:              tablet,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:             true,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+		MasterTermStartTime: 10,
+	}
+	input <- shr
+	result = <-resultChan
+	mustMatch(t, want, result, "Wrong TabletHealth data")
+
+	// Stream error
+	fc.errCh <- fmt.Errorf("some stream error")
+	want = &TabletHealth{
+		Tablet:              tablet,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:             false,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+		MasterTermStartTime: 10,
+		LastError:           fmt.Errorf("some stream error"),
+	}
+	result = <-resultChan
+	//TODO: figure out how to compare objects that contain errors using utils.MustMatch
+	assert.True(t, want.DeepEqual(result), "Wrong TabletHealth data\n Expected: %v\n Actual:   %v", want, result)
+	// tablet should be removed from healthy list
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER})
+	assert.Empty(t, a, "wrong result, expected empty list")
 }
 
 func TestHealthCheckVerifiesTabletAlias(t *testing.T) {
@@ -260,8 +329,7 @@ func TestHealthCheckVerifiesTabletAlias(t *testing.T) {
 	hc := createTestHc(ts)
 	defer hc.Close()
 
-	tablet := topo.NewTablet(1, "cell", "a")
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse, 1)
 	fc := createFakeConn(tablet, input)
 	resultChan := hc.Subscribe()
@@ -271,7 +339,7 @@ func TestHealthCheckVerifiesTabletAlias(t *testing.T) {
 	// Immediately after AddTablet() there will be the first notification.
 	want := &TabletHealth{
 		Tablet:              tablet,
-		Target:              &querypb.Target{},
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s"},
 		Serving:             false,
 		MasterTermStartTime: 0,
 	}
@@ -302,8 +370,7 @@ func TestHealthCheckVerifiesTabletAlias(t *testing.T) {
 func TestHealthCheckCloseWaitsForGoRoutines(t *testing.T) {
 	ts := memorytopo.NewServer("cell")
 	hc := createTestHc(ts)
-	tablet := topo.NewTablet(0, "cell", "a")
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse, 1)
 	createFakeConn(tablet, input)
 	resultChan := hc.Subscribe()
@@ -313,7 +380,7 @@ func TestHealthCheckCloseWaitsForGoRoutines(t *testing.T) {
 	// Immediately after AddTablet() there will be the first notification.
 	want := &TabletHealth{
 		Tablet:              tablet,
-		Target:              &querypb.Target{},
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s"},
 		Serving:             false,
 		MasterTermStartTime: 0,
 	}
@@ -329,10 +396,11 @@ func TestHealthCheckCloseWaitsForGoRoutines(t *testing.T) {
 		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
 	}
 	want = &TabletHealth{
-		Tablet:              tablet,
-		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
-		Serving:             true,
-		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+		Tablet:  tablet,
+		Target:  &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving: true,
+		Stats:   &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+
 		MasterTermStartTime: 0,
 	}
 	input <- shr
@@ -360,13 +428,13 @@ func TestHealthCheckCloseWaitsForGoRoutines(t *testing.T) {
 }
 
 func TestHealthCheckTimeout(t *testing.T) {
+	// reset counters
+	hcErrorCounters.ResetAll()
 	ts := memorytopo.NewServer("cell")
 	hc := createTestHc(ts)
 	hc.healthCheckTimeout = 500 * time.Millisecond
 	defer hc.Close()
-
-	tablet := topo.NewTablet(0, "cell", "a")
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(tablet, input)
 	resultChan := hc.Subscribe()
@@ -374,7 +442,7 @@ func TestHealthCheckTimeout(t *testing.T) {
 	// Immediately after AddTablet() there will be the first notification.
 	want := &TabletHealth{
 		Tablet:              tablet,
-		Target:              &querypb.Target{},
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s"},
 		Serving:             false,
 		MasterTermStartTime: 0,
 	}
@@ -409,6 +477,10 @@ func TestHealthCheckTimeout(t *testing.T) {
 	assert.Nil(t, checkErrorCounter("k", "s", topodatapb.TabletType_REPLICA, 1))
 	assert.True(t, fc.isCanceled(), "StreamHealth should be canceled after timeout, but is not")
 
+	// tablet should be removed from healthy list
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
+	assert.Empty(t, a, "wrong result, expected empty list")
+
 	// repeat the wait. It will timeout one more time trying to get the connection.
 	fc.resetCanceledFlag()
 	time.Sleep(hc.healthCheckTimeout)
@@ -427,15 +499,142 @@ func TestHealthCheckTimeout(t *testing.T) {
 	mustMatch(t, want, result, "Wrong TabletHealth data")
 }
 
+func TestWaitForAllServingTablets(t *testing.T) {
+	ts := memorytopo.NewServer("cell")
+	hc := createTestHc(ts)
+	defer hc.Close()
+	tablet := createTestTablet(0, "cell", "a")
+	tablet.Type = topodatapb.TabletType_REPLICA
+	targets := []*query.Target{
+		{
+			Keyspace:   tablet.Keyspace,
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+	}
+	input := make(chan *querypb.StreamHealthResponse)
+	createFakeConn(tablet, input)
+
+	// create a channel and subscribe to healthcheck
+	resultChan := hc.Subscribe()
+	hc.AddTablet(tablet)
+	// there will be a first result, get and discard it
+	<-resultChan
+	// empty
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	err := hc.WaitForAllServingTablets(ctx, targets)
+	assert.NotNil(t, err, "error should not be nil")
+
+	shr := &querypb.StreamHealthResponse{
+		TabletAlias:                         tablet.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 0,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+	}
+
+	input <- shr
+	<-resultChan
+	// // check it's there
+
+	targets = []*query.Target{
+		{
+			Keyspace:   tablet.Keyspace,
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+	}
+
+	err = hc.WaitForAllServingTablets(ctx, targets)
+	assert.Nil(t, err, "error should be nil. Targets are found")
+
+	targets = []*query.Target{
+		{
+			Keyspace:   tablet.Keyspace,
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+		{
+			Keyspace:   "newkeyspace",
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+	}
+
+	err = hc.WaitForAllServingTablets(ctx, targets)
+	assert.NotNil(t, err, "error should not be nil (there are no tablets on this keyspace")
+
+	targets = []*query.Target{
+		{
+			Keyspace:   tablet.Keyspace,
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+		{
+			Keyspace:   "newkeyspace",
+			Shard:      tablet.Shard,
+			TabletType: tablet.Type,
+		},
+	}
+
+	KeyspacesToWatch = []string{tablet.Keyspace}
+
+	err = hc.WaitForAllServingTablets(ctx, targets)
+	assert.Nil(t, err, "error should be nil. Keyspace with no tablets is filtered")
+
+	KeyspacesToWatch = []string{}
+}
+
+// TestRemoveTablet tests the behavior when a tablet goes away.
+func TestRemoveTablet(t *testing.T) {
+	ts := memorytopo.NewServer("cell")
+	hc := createTestHc(ts)
+	defer hc.Close()
+	tablet := createTestTablet(0, "cell", "a")
+	tablet.Type = topodatapb.TabletType_REPLICA
+	input := make(chan *querypb.StreamHealthResponse)
+	createFakeConn(tablet, input)
+
+	// create a channel and subscribe to healthcheck
+	resultChan := hc.Subscribe()
+	hc.AddTablet(tablet)
+	// there will be a first result, get and discard it
+	<-resultChan
+
+	shr := &querypb.StreamHealthResponse{
+		TabletAlias:                         tablet.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 0,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+	}
+	want := []*TabletHealth{{
+		Tablet:              tablet,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:             true,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 1, CpuUsage: 0.2},
+		MasterTermStartTime: 0,
+	}}
+	input <- shr
+	<-resultChan
+	// check it's there
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
+	mustMatch(t, want, a, "unexpected result")
+
+	// delete the tablet
+	hc.RemoveTablet(tablet)
+	a = hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
+	assert.Empty(t, a, "wrong result, expected empty list")
+}
+
 // TestGetHealthyTablets tests the functionality of GetHealthyTabletStats.
 func TestGetHealthyTablets(t *testing.T) {
 	ts := memorytopo.NewServer("cell")
 	hc := createTestHc(ts)
 	defer hc.Close()
-	tablet := topo.NewTablet(0, "cell", "a")
-	tablet.Keyspace = "k"
-	tablet.Shard = "s"
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(0, "cell", "a")
 	tablet.Type = topodatapb.TabletType_REPLICA
 	input := make(chan *querypb.StreamHealthResponse)
 	createFakeConn(tablet, input)
@@ -507,16 +706,11 @@ func TestGetHealthyTablets(t *testing.T) {
 	mustMatch(t, want, a, "unexpected result")
 
 	// add a second tablet
-	tablet2 := topo.NewTablet(11, "cell", "host2")
-	tablet2.Keyspace = "k"
-	tablet2.Shard = "s"
-	tablet2.PortMap["vt"] = 2
+	tablet2 := createTestTablet(11, "cell", "host2")
 	tablet2.Type = topodatapb.TabletType_REPLICA
 	input2 := make(chan *querypb.StreamHealthResponse)
 	createFakeConn(tablet2, input2)
-	t.Logf(`createFakeConn({Host: "a", PortMap: {"vt": 2}}, c)`)
 	hc.AddTablet(tablet2)
-	t.Logf(`hc = HealthCheck(); hc.AddTablet({Host: "a", PortMap: {"vt": 1}}, "")`)
 	// there will be a first result, get and discard it
 	<-resultChan
 
@@ -565,11 +759,13 @@ func TestGetHealthyTablets(t *testing.T) {
 
 	// second tablet turns into a master
 	shr2 = &querypb.StreamHealthResponse{
-		TabletAlias:                         tablet2.Alias,
-		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
-		Serving:                             true,
+		TabletAlias: tablet2.Alias,
+		Target:      &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:     true,
+
 		TabletExternallyReparentedTimestamp: 10,
-		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 0, CpuUsage: 0.2},
+
+		RealtimeStats: &querypb.RealtimeStats{SecondsBehindMaster: 0, CpuUsage: 0.2},
 	}
 	input2 <- shr2
 	// wait for result
@@ -620,27 +816,178 @@ func TestGetHealthyTablets(t *testing.T) {
 	mustMatch(t, want, a, "unexpected result")
 }
 
-func TestAliases(t *testing.T) {
-	ts := memorytopo.NewServer("cell", "cell1", "cell2")
-	hc := createTestHc(ts)
+func TestMasterInOtherCell(t *testing.T) {
+	ts := memorytopo.NewServer("cell1", "cell2")
+	hc := NewHealthCheck(context.Background(), 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
+	defer hc.Close()
+
+	// add a tablet as master in different cell
+	tablet := createTestTablet(1, "cell2", "host1")
+	tablet.Type = topodatapb.TabletType_MASTER
+	input := make(chan *querypb.StreamHealthResponse)
+	fc := createFakeConn(tablet, input)
+	// create a channel and subscribe to healthcheck
+	resultChan := hc.Subscribe()
+	hc.AddTablet(tablet)
+	// should get a result, but this will hang if multi-cell logic is broken
+	// so wait and timeout
+	ticker := time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case <-resultChan:
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	shr := &querypb.StreamHealthResponse{
+		TabletAlias:                         tablet.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 20,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 0, CpuUsage: 0.2},
+	}
+	want := &TabletHealth{
+		Tablet:              tablet,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER},
+		Serving:             true,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 0, CpuUsage: 0.2},
+		MasterTermStartTime: 20,
+	}
+
+	input <- shr
+	ticker = time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case got := <-resultChan:
+		// check that we DO receive health check update for MASTER in other cell
+		mustMatch(t, want, got, "Wrong TabletHealth data")
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	// check that MASTER tablet from other cell IS in healthy tablet list
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_MASTER})
+	require.Len(t, a, 1, "")
+	mustMatch(t, want, a[0], "Expecting healthy master")
+}
+
+func TestReplicaInOtherCell(t *testing.T) {
+	ts := memorytopo.NewServer("cell1", "cell2")
+	hc := NewHealthCheck(context.Background(), 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
+	defer hc.Close()
+
+	// add a tablet as replica
+	local := createTestTablet(1, "cell1", "host1")
+	local.Type = topodatapb.TabletType_REPLICA
+	input := make(chan *querypb.StreamHealthResponse)
+	fc := createFakeConn(local, input)
+	// create a channel and subscribe to healthcheck
+	resultChan := hc.Subscribe()
+	hc.AddTablet(local)
+
+	ticker := time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case <-resultChan:
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	shr := &querypb.StreamHealthResponse{
+		TabletAlias:                         local.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 0,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 10, CpuUsage: 0.2},
+	}
+	want := &TabletHealth{
+		Tablet:              local,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:             true,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 10, CpuUsage: 0.2},
+		MasterTermStartTime: 0,
+	}
+
+	input <- shr
+	ticker = time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case got := <-resultChan:
+		// check that we DO receive health check update for REPLICA in other cell
+		mustMatch(t, want, got, "Wrong TabletHealth data")
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	// add a tablet as replica in different cell
+	remote := createTestTablet(2, "cell2", "host2")
+	remote.Type = topodatapb.TabletType_REPLICA
+	input2 := make(chan *querypb.StreamHealthResponse)
+	fc2 := createFakeConn(remote, input2)
+	// create a channel and subscribe to healthcheck
+	resultChan2 := hc.Subscribe()
+	hc.AddTablet(remote)
+	// should get a result, but this will hang if multi-cell logic is broken
+	// so wait and timeout
+	ticker = time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc2.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case <-resultChan2:
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	shr2 := &querypb.StreamHealthResponse{
+		TabletAlias:                         remote.Alias,
+		Target:                              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:                             true,
+		TabletExternallyReparentedTimestamp: 0,
+		RealtimeStats:                       &querypb.RealtimeStats{SecondsBehindMaster: 10, CpuUsage: 0.2},
+	}
+	want2 := &TabletHealth{
+		Tablet:              remote,
+		Target:              &querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA},
+		Serving:             true,
+		Stats:               &querypb.RealtimeStats{SecondsBehindMaster: 10, CpuUsage: 0.2},
+		MasterTermStartTime: 0,
+	}
+
+	input2 <- shr2
+	ticker = time.NewTicker(1 * time.Second)
+	select {
+	case err := <-fc.cbErrCh:
+		require.Fail(t, "Unexpected error: %v", err)
+	case got := <-resultChan2:
+		// check that we DO receive health check update for REPLICA in other cell
+		mustMatch(t, want2, got, "Wrong TabletHealth data")
+	case <-ticker.C:
+		require.Fail(t, "Timed out waiting for HealthCheck update")
+	}
+
+	// check that only REPLICA tablet from cell1 is in healthy tablet list
+	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
+	require.Len(t, a, 1, "")
+	mustMatch(t, want, a[0], "Expecting healthy local replica")
+}
+
+func TestCellAliases(t *testing.T) {
+	ts := memorytopo.NewServer("cell1", "cell2")
+	hc := NewHealthCheck(context.Background(), 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
 	defer hc.Close()
 
 	cellsAlias := &topodatapb.CellsAlias{
-		Cells: []string{"cell", "cell1"},
+		Cells: []string{"cell1", "cell2"},
 	}
 	assert.Nil(t, ts.CreateCellsAlias(context.Background(), "region1", cellsAlias), "failed to create cell alias")
 	defer ts.DeleteCellsAlias(context.Background(), "region1")
-	cellsAlias = &topodatapb.CellsAlias{
-		Cells: []string{"cell2"},
-	}
-	assert.Nil(t, ts.CreateCellsAlias(context.Background(), "region2", cellsAlias), "failed to create cell alias")
-	defer ts.DeleteCellsAlias(context.Background(), "region2")
 
 	// add a tablet as replica in diff cell, same region
-	tablet := topo.NewTablet(1, "cell1", "host3")
-	tablet.Keyspace = "k"
-	tablet.Shard = "s"
-	tablet.PortMap["vt"] = 1
+	tablet := createTestTablet(1, "cell2", "host2")
 	tablet.Type = topodatapb.TabletType_REPLICA
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(tablet, input)
@@ -686,29 +1033,26 @@ func TestAliases(t *testing.T) {
 	// check it's there
 	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
 	mustMatch(t, want, a, "Wrong TabletHealth data")
+}
 
-	// add another tablet in a diff cell, diff region
-	tablet2 := topo.NewTablet(2, "cell2", "host4")
-	tablet2.Keyspace = "k"
-	tablet2.Shard = "s"
-	tablet2.PortMap["vt"] = 2
-	tablet2.Type = topodatapb.TabletType_REPLICA
-	input2 := make(chan *querypb.StreamHealthResponse)
-	fc = createFakeConn(tablet2, input2)
-	hc.AddTablet(tablet2)
-	// we should NOT get a result because this tablet is not of interest to us
-	ticker = time.NewTicker(1 * time.Second)
+func TestHealthCheckChecksGrpcPort(t *testing.T) {
+	ts := memorytopo.NewServer("cell")
+	hc := createTestHc(ts)
+	defer hc.Close()
+
+	tablet := createTestTablet(0, "cell", "a")
+	tablet.PortMap["grpc"] = 0
+	resultChan := hc.Subscribe()
+
+	// AddTablet should not add the tablet because port is 0
+	hc.AddTablet(tablet)
+
 	select {
-	case err := <-fc.cbErrCh:
-		require.Fail(t, "Unexpected error: %v", err)
 	case result := <-resultChan:
-		require.Fail(t, "Unexpected result: %v", result)
-	case <-ticker.C:
+		assert.Nil(t, result, "healthCheck received result: %v", result)
+	case <-time.After(2 * time.Millisecond):
+		// No response after timeout. Success.
 	}
-
-	// check that we still have only tablet in healthy list
-	a = hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
-	mustMatch(t, want, a, "Wrong TabletHealth data")
 }
 
 func TestTemplate(t *testing.T) {
@@ -736,7 +1080,6 @@ func TestTemplate(t *testing.T) {
 }
 
 func TestDebugURLFormatting(t *testing.T) {
-
 	//log error
 	if err2 := flag.Set("tablet_url_template", "https://{{.GetHostNameLevel 0}}.bastion.{{.Tablet.Alias.Cell}}.corp"); err2 != nil {
 		log.Errorf("flag.Set(\"tablet_url_template\", \"https://{{.GetHostNameLevel 0}}.bastion.{{.Tablet.Alias.Cell}}.corp\") failed : %v", err2)
@@ -769,6 +1112,9 @@ func TestDebugURLFormatting(t *testing.T) {
 }
 
 func tabletDialer(tablet *topodatapb.Tablet, _ grpcclient.FailFast) (queryservice.QueryService, error) {
+	connMapMu.Lock()
+	defer connMapMu.Unlock()
+
 	key := TabletToMapKey(tablet)
 	if qs, ok := connMap[key]; ok {
 		return qs, nil
@@ -777,7 +1123,7 @@ func tabletDialer(tablet *topodatapb.Tablet, _ grpcclient.FailFast) (queryservic
 }
 
 func createTestHc(ts *topo.Server) *HealthCheckImpl {
-	return NewHealthCheck(context.Background(), 1*time.Millisecond, time.Hour, ts, "cell")
+	return NewHealthCheck(context.Background(), 1*time.Millisecond, time.Hour, ts, "cell", "")
 }
 
 type fakeConn struct {
@@ -797,6 +1143,8 @@ type fakeConn struct {
 }
 
 func createFakeConn(tablet *topodatapb.Tablet, c chan *querypb.StreamHealthResponse) *fakeConn {
+	connMapMu.Lock()
+	defer connMapMu.Unlock()
 	key := TabletToMapKey(tablet)
 	conn := &fakeConn{
 		QueryService: fakes.ErrorQueryService,
@@ -860,6 +1208,28 @@ func checkErrorCounter(keyspace, shard string, tabletType topodatapb.TabletType,
 		return fmt.Errorf("wrong value for hcErrorCounters got = %v, want = %v", got, want)
 	}
 	return nil
+}
+
+func createFixedHealthConn(tablet *topodatapb.Tablet, fixedResult *querypb.StreamHealthResponse) *fakeConn {
+	key := TabletToMapKey(tablet)
+	conn := &fakeConn{
+		QueryService: fakes.ErrorQueryService,
+		tablet:       tablet,
+		fixedResult:  fixedResult,
+	}
+	connMapMu.Lock()
+	defer connMapMu.Unlock()
+	connMap[key] = conn
+	return conn
+}
+
+func createTestTablet(uid uint32, cell, host string) *topodatapb.Tablet {
+	tablet := topo.NewTablet(uid, cell, host)
+	tablet.PortMap["vt"] = 1
+	tablet.PortMap["grpc"] = 2
+	tablet.Keyspace = "k"
+	tablet.Shard = "s"
+	return tablet
 }
 
 var mustMatch = utils.MustMatchFn(

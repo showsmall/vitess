@@ -24,7 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 
@@ -57,8 +58,13 @@ type vplayer struct {
 	lastTimestampNs int64
 	// timeOffsetNs keeps track of the clock difference with respect to source tablet.
 	timeOffsetNs int64
+	// numAccumulatedHeartbeats keeps track of how many heartbeats have been received since we updated the time_updated column of _vt.vreplication
+	numAccumulatedHeartbeats int
+
 	// canAcceptStmtEvents is set to true if the current player can accept events in statement mode. Only true for filters that are match all.
 	canAcceptStmtEvents bool
+
+	phase string
 }
 
 // newVPlayer creates a new vplayer. Parameters:
@@ -70,7 +76,7 @@ type vplayer struct {
 //   replication is only applied to parts that have been copied so far.
 // pausePos: if set, replication will stop at that position without updating the state to "Stopped".
 //   This is used by the fastForward function during copying.
-func newVPlayer(vr *vreplicator, settings binlogplayer.VRSettings, copyState map[string]*sqltypes.Result, pausePos mysql.Position) *vplayer {
+func newVPlayer(vr *vreplicator, settings binlogplayer.VRSettings, copyState map[string]*sqltypes.Result, pausePos mysql.Position, phase string) *vplayer {
 	saveStop := true
 	if !pausePos.IsZero() {
 		settings.StopPos = pausePos
@@ -85,6 +91,7 @@ func newVPlayer(vr *vreplicator, settings binlogplayer.VRSettings, copyState map
 		copyState:     copyState,
 		timeLastSaved: time.Now(),
 		tablePlans:    make(map[string]*TablePlan),
+		phase:         phase,
 	}
 }
 
@@ -98,8 +105,9 @@ func (vp *vplayer) play(ctx context.Context) error {
 		return nil
 	}
 
-	plan, err := buildReplicatorPlan(vp.vr.source.Filter, vp.vr.tableKeys, vp.copyState)
+	plan, err := buildReplicatorPlan(vp.vr.source.Filter, vp.vr.pkInfoMap, vp.copyState)
 	if err != nil {
+		vp.vr.stats.ErrorCounts.Add([]string{"Plan"}, 1)
 		return err
 	}
 	vp.replicatorPlan = plan
@@ -132,7 +140,7 @@ func (vp *vplayer) fetchAndApply(ctx context.Context) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	relay := newRelayLog(ctx, relayLogMaxItems, relayLogMaxSize)
+	relay := newRelayLog(ctx, *relayLogMaxItems, *relayLogMaxSize)
 
 	streamErr := make(chan error, 1)
 	go func() {
@@ -183,9 +191,17 @@ func (vp *vplayer) fetchAndApply(ctx context.Context) (err error) {
 	}
 }
 
+// applyStmtEvent applies an actual DML statement received from the source, directly onto the backend database
 func (vp *vplayer) applyStmtEvent(ctx context.Context, event *binlogdatapb.VEvent) error {
-	if vp.canAcceptStmtEvents {
-		_, err := vp.vr.dbClient.ExecuteWithRetry(ctx, event.Dml)
+	sql := event.Statement
+	if sql == "" {
+		sql = event.Dml
+	}
+	if event.Type == binlogdatapb.VEventType_SAVEPOINT || vp.canAcceptStmtEvents {
+		start := time.Now()
+		_, err := vp.vr.dbClient.ExecuteWithRetry(ctx, sql)
+		vp.vr.stats.QueryTimings.Record(vp.phase, start)
+		vp.vr.stats.QueryCount.Add(vp.phase, 1)
 		return err
 	}
 	return fmt.Errorf("filter rules are not supported for SBR replication: %v", vp.vr.source.Filter.GetRules())
@@ -199,9 +215,12 @@ func (vp *vplayer) applyRowEvent(ctx context.Context, rowEvent *binlogdatapb.Row
 	for _, change := range rowEvent.RowChanges {
 		_, err := tplan.applyChange(change, func(sql string) (*sqltypes.Result, error) {
 			stats := NewVrLogStats("ROWCHANGE")
-			result, err := vp.vr.dbClient.ExecuteWithRetry(ctx, sql)
+			start := time.Now()
+			qr, err := vp.vr.dbClient.ExecuteWithRetry(ctx, sql)
+			vp.vr.stats.QueryCount.Add(vp.phase, 1)
+			vp.vr.stats.QueryTimings.Record(vp.phase, start)
 			stats.Send(sql)
-			return result, err
+			return qr, err
 		})
 		if err != nil {
 			return err
@@ -211,6 +230,7 @@ func (vp *vplayer) applyRowEvent(ctx context.Context, rowEvent *binlogdatapb.Row
 }
 
 func (vp *vplayer) updatePos(ts int64) (posReached bool, err error) {
+	vp.numAccumulatedHeartbeats = 0
 	update := binlogplayer.GenerateUpdatePos(vp.vr.id, vp.pos, time.Now().Unix(), ts)
 	if _, err := vp.vr.dbClient.Execute(update); err != nil {
 		return false, fmt.Errorf("error %v updating position", err)
@@ -228,6 +248,32 @@ func (vp *vplayer) updatePos(ts int64) (posReached bool, err error) {
 		}
 	}
 	return posReached, nil
+}
+
+func (vp *vplayer) updateCurrentTime(tm int64) error {
+	update, err := binlogplayer.GenerateUpdateTime(vp.vr.id, tm)
+	if err != nil {
+		return err
+	}
+	if _, err := vp.vr.dbClient.Execute(update); err != nil {
+		return fmt.Errorf("error %v updating time", err)
+	}
+	return nil
+}
+
+func (vp *vplayer) mustUpdateCurrentTime() bool {
+	return vp.numAccumulatedHeartbeats >= *vreplicationHeartbeatUpdateInterval ||
+		vp.numAccumulatedHeartbeats >= vreplicationMinimumHeartbeatUpdateInterval
+}
+
+func (vp *vplayer) recordHeartbeat() error {
+	tm := time.Now().Unix()
+	vp.vr.stats.RecordHeartbeat(tm)
+	if !vp.mustUpdateCurrentTime() {
+		return nil
+	}
+	vp.numAccumulatedHeartbeats = 0
+	return vp.updateCurrentTime(tm)
 }
 
 // applyEvents is the main thread that applies the events. It has the following use
@@ -287,6 +333,11 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 	defer vp.vr.stats.SecondsBehindMaster.Set(math.MaxInt64)
 	var sbm int64 = -1
 	for {
+		// check throttler.
+		if !vp.vr.vre.throttlerClient.ThrottleCheckOKOrWait(ctx) {
+			continue
+		}
+
 		items, err := relay.Fetch()
 		if err != nil {
 			return err
@@ -340,6 +391,10 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 					}
 				}
 				if err := vp.applyEvent(ctx, event, mustSave); err != nil {
+					if err != io.EOF {
+						vp.vr.stats.ErrorCounts.Add([]string{"Apply"}, 1)
+						log.Errorf("Error applying event: %s", err.Error())
+					}
 					return err
 				}
 			}
@@ -418,18 +473,23 @@ func (vp *vplayer) applyEvent(ctx context.Context, event *binlogdatapb.VEvent, m
 		vp.tablePlans[event.FieldEvent.TableName] = tplan
 		stats.Send(fmt.Sprintf("%v", event.FieldEvent))
 
-	case binlogdatapb.VEventType_INSERT, binlogdatapb.VEventType_DELETE, binlogdatapb.VEventType_UPDATE, binlogdatapb.VEventType_REPLACE:
+	case binlogdatapb.VEventType_INSERT, binlogdatapb.VEventType_DELETE, binlogdatapb.VEventType_UPDATE,
+		binlogdatapb.VEventType_REPLACE, binlogdatapb.VEventType_SAVEPOINT:
+		// use event.Statement if available, preparing for deprecation in 8.0
+		sql := event.Statement
+		if sql == "" {
+			sql = event.Dml
+		}
 		// If the event is for one of the AWS RDS "special" tables, we skip
-		if !strings.Contains(event.Dml, " mysql.rds_") {
-			// This is a player using stament based replication
+		if !strings.Contains(sql, " mysql.rds_") {
+			// This is a player using statement based replication
 			if err := vp.vr.dbClient.Begin(); err != nil {
 				return err
 			}
-
 			if err := vp.applyStmtEvent(ctx, event); err != nil {
 				return err
 			}
-			stats.Send(fmt.Sprintf(event.Dml))
+			stats.Send(sql)
 		}
 	case binlogdatapb.VEventType_ROW:
 		// This player is configured for row based replication
@@ -478,7 +538,7 @@ func (vp *vplayer) applyEvent(ctx context.Context, event *binlogdatapb.VEvent, m
 			if _, err := vp.updatePos(event.Timestamp); err != nil {
 				return err
 			}
-			if err := vp.vr.setState(binlogplayer.BlpStopped, fmt.Sprintf("Stopped at DDL %s", event.Ddl)); err != nil {
+			if err := vp.vr.setState(binlogplayer.BlpStopped, fmt.Sprintf("Stopped at DDL %s", event.Statement)); err != nil {
 				return err
 			}
 			if err := vp.vr.dbClient.Commit(); err != nil {
@@ -490,10 +550,10 @@ func (vp *vplayer) applyEvent(ctx context.Context, event *binlogdatapb.VEvent, m
 			// So, we apply the DDL first, and then save the position.
 			// Manual intervention may be needed if there is a partial
 			// failure here.
-			if _, err := vp.vr.dbClient.ExecuteWithRetry(ctx, event.Ddl); err != nil {
+			if _, err := vp.vr.dbClient.ExecuteWithRetry(ctx, event.Statement); err != nil {
 				return err
 			}
-			stats.Send(fmt.Sprintf("%v", event.Ddl))
+			stats.Send(fmt.Sprintf("%v", event.Statement))
 			posReached, err := vp.updatePos(event.Timestamp)
 			if err != nil {
 				return err
@@ -502,10 +562,10 @@ func (vp *vplayer) applyEvent(ctx context.Context, event *binlogdatapb.VEvent, m
 				return io.EOF
 			}
 		case binlogdatapb.OnDDLAction_EXEC_IGNORE:
-			if _, err := vp.vr.dbClient.ExecuteWithRetry(ctx, event.Ddl); err != nil {
-				log.Infof("Ignoring error: %v for DDL: %s", err, event.Ddl)
+			if _, err := vp.vr.dbClient.ExecuteWithRetry(ctx, event.Statement); err != nil {
+				log.Infof("Ignoring error: %v for DDL: %s", err, event.Statement)
 			}
-			stats.Send(fmt.Sprintf("%v", event.Ddl))
+			stats.Send(fmt.Sprintf("%v", event.Statement))
 			posReached, err := vp.updatePos(event.Timestamp)
 			if err != nil {
 				return err
@@ -562,7 +622,14 @@ func (vp *vplayer) applyEvent(ctx context.Context, event *binlogdatapb.VEvent, m
 		stats.Send(fmt.Sprintf("%v", event.Journal))
 		return io.EOF
 	case binlogdatapb.VEventType_HEARTBEAT:
-		// No-op: heartbeat timings are calculated in outer loop.
+		if !vp.vr.dbClient.InTransaction {
+			vp.numAccumulatedHeartbeats++
+			err := vp.recordHeartbeat()
+			if err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }

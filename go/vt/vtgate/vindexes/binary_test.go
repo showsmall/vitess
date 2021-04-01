@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
@@ -35,7 +36,7 @@ func init() {
 }
 
 func TestBinaryInfo(t *testing.T) {
-	assert.Equal(t, 1, binOnlyVindex.Cost())
+	assert.Equal(t, 0, binOnlyVindex.Cost())
 	assert.Equal(t, "binary_varchar", binOnlyVindex.String())
 	assert.True(t, binOnlyVindex.IsUnique())
 	assert.False(t, binOnlyVindex.NeedsVCursor())
@@ -48,6 +49,9 @@ func TestBinaryMap(t *testing.T) {
 	}{{
 		in:  sqltypes.NewVarChar("test1"),
 		out: []byte("test1"),
+	}, {
+		in:  sqltypes.NULL,
+		out: []byte(nil),
 	}, {
 		in:  sqltypes.NewVarChar("test2"),
 		out: []byte("test2"),

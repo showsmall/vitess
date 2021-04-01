@@ -17,12 +17,20 @@ limitations under the License.
 package wrangler
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/vt/topo"
+
+	"vitess.io/vitess/go/vt/sqlparser"
+
+	"context"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/sqltypes"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
@@ -362,7 +370,7 @@ func TestVDiffPlanSuccess(t *testing.T) {
 		t.Run(tcase.input.Filter, func(t *testing.T) {
 			filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{tcase.input}}
 			df := &vdiff{}
-			err := df.buildVDiffPlan(context.Background(), filter, schm)
+			err := df.buildVDiffPlan(context.Background(), filter, schm, nil)
 			require.NoError(t, err, tcase.input)
 			require.Equal(t, 1, len(df.differs), tcase.input)
 			assert.Equal(t, tcase.td, df.differs[tcase.table], tcase.input)
@@ -417,7 +425,7 @@ func TestVDiffPlanFailure(t *testing.T) {
 	for _, tcase := range testcases {
 		filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{tcase.input}}
 		df := &vdiff{}
-		err := df.buildVDiffPlan(context.Background(), filter, schm)
+		err := df.buildVDiffPlan(context.Background(), filter, schm, nil)
 		assert.EqualError(t, err, tcase.err, tcase.input)
 	}
 }
@@ -557,7 +565,7 @@ func TestVDiffUnsharded(t *testing.T) {
 		env.tablets[101].setResults("select c1, c2 from t1 order by c1 asc", vdiffSourceGtid, tcase.source)
 		env.tablets[201].setResults("select c1, c2 from t1 order by c1 asc", vdiffTargetMasterPosition, tcase.target)
 
-		dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+		dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, "", 100, "")
 		require.NoError(t, err)
 		assert.Equal(t, tcase.dr, dr["t1"], tcase.id)
 	}
@@ -619,7 +627,7 @@ func TestVDiffSharded(t *testing.T) {
 		),
 	)
 
-	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
 	wantdr := &DiffReport{
 		ProcessedRows: 3,
@@ -685,7 +693,7 @@ func TestVDiffAggregates(t *testing.T) {
 		),
 	)
 
-	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
 	wantdr := &DiffReport{
 		ProcessedRows: 5,
@@ -749,7 +757,7 @@ func TestVDiffPKWeightString(t *testing.T) {
 		),
 	)
 
-	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
 	wantdr := &DiffReport{
 		ProcessedRows: 4,
@@ -813,7 +821,7 @@ func TestVDiffNoPKWeightString(t *testing.T) {
 		),
 	)
 
-	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	dr, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
 	wantdr := &DiffReport{
 		ProcessedRows: 4,
@@ -851,12 +859,28 @@ func TestVDiffDefaults(t *testing.T) {
 	env.tablets[101].setResults("select c1, c2 from t1 order by c1 asc", vdiffSourceGtid, source)
 	env.tablets[201].setResults("select c1, c2 from t1 order by c1 asc", vdiffTargetMasterPosition, target)
 
-	_, err := env.wr.VDiff(context.Background(), "target", env.workflow, "", "", "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	_, err := env.wr.VDiff(context.Background(), "target", env.workflow, "", "", "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
-	_, err = env.wr.VDiff(context.Background(), "target", env.workflow, "", env.cell, "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+	_, err = env.wr.VDiff(context.Background(), "target", env.workflow, "", env.cell, "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
-	_, err = env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, "", "replica", 30*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
+
+	var df map[string]*DiffReport
+	df, err = env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, "", "replica", 30*time.Second, "", 100, "")
 	require.NoError(t, err)
+	require.Equal(t, df["t1"].ProcessedRows, 3)
+	df, err = env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, "", "replica", 30*time.Second, "", 1, "")
+	require.NoError(t, err)
+	require.Equal(t, df["t1"].ProcessedRows, 1)
+	df, err = env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, "", "replica", 30*time.Second, "", 0, "")
+	require.NoError(t, err)
+	require.Equal(t, df["t1"].ProcessedRows, 0)
+
+	_, err = env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, "", "replica", 1*time.Nanosecond, "", 100, "")
+	require.Error(t, err)
+	err = topo.CheckKeyspaceLocked(context.Background(), "target")
+	require.EqualErrorf(t, err, "keyspace target is not locked (no locksInfo)", "")
+	err = topo.CheckKeyspaceLocked(context.Background(), "source")
+	require.EqualErrorf(t, err, "keyspace source is not locked (no locksInfo)", "")
 }
 
 func TestVDiffReplicationWait(t *testing.T) {
@@ -888,6 +912,139 @@ func TestVDiffReplicationWait(t *testing.T) {
 	env.tablets[101].setResults("select c1, c2 from t1 order by c1 asc", vdiffSourceGtid, source)
 	env.tablets[201].setResults("select c1, c2 from t1 order by c1 asc", vdiffTargetMasterPosition, target)
 
-	_, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 0*time.Second, 1*time.Second, 1*time.Second, 1*time.Minute, "")
-	require.EqualError(t, err, "startQueryStreams(sources): WaitForPosition for tablet cell-0000000101: context deadline exceeded")
+	_, err := env.wr.VDiff(context.Background(), "target", env.workflow, env.cell, env.cell, "replica", 0*time.Second, "", 100, "")
+	require.Error(t, err)
+	require.True(t, strings.Contains(err.Error(), "context deadline exceeded"))
+}
+
+func TestVDiffFindPKs(t *testing.T) {
+
+	testcases := []struct {
+		name         string
+		table        *tabletmanagerdatapb.TableDefinition
+		targetSelect *sqlparser.Select
+		tdIn         *tableDiffer
+		tdOut        *tableDiffer
+		errorString  string
+	}{
+		{
+			name: "",
+			table: &tabletmanagerdatapb.TableDefinition{
+				Name:              "t1",
+				Columns:           []string{"c1", "c2"},
+				PrimaryKeyColumns: []string{"c1"},
+				Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+			},
+			targetSelect: &sqlparser.Select{
+				SelectExprs: sqlparser.SelectExprs{
+					&sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent("c1")}},
+					&sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent("c2")}},
+				},
+			},
+			tdIn: &tableDiffer{
+				compareCols: []int{0, 1},
+				comparePKs:  []int{},
+			},
+			tdOut: &tableDiffer{
+				compareCols: []int{-1, 1},
+				comparePKs:  []int{0},
+			},
+		}, {
+			name: "",
+			table: &tabletmanagerdatapb.TableDefinition{
+				Name:              "t1",
+				Columns:           []string{"c1", "c2", "c3", "c4"},
+				PrimaryKeyColumns: []string{"c1", "c4"},
+				Fields:            sqltypes.MakeTestFields("c1|c2|c3|c4", "int64|int64|varchar|int64"),
+			},
+			targetSelect: &sqlparser.Select{
+				SelectExprs: sqlparser.SelectExprs{
+					&sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent("c1")}},
+					&sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent("c2")}},
+					&sqlparser.AliasedExpr{Expr: &sqlparser.FuncExpr{Name: sqlparser.NewColIdent("c3")}},
+					&sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent("c4")}},
+				},
+			},
+			tdIn: &tableDiffer{
+				compareCols: []int{0, 1, 2, 3},
+				comparePKs:  []int{},
+			},
+			tdOut: &tableDiffer{
+				compareCols: []int{-1, 1, 2, -1},
+				comparePKs:  []int{0, 3},
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := findPKs(tc.table, tc.targetSelect, tc.tdIn)
+			require.NoError(t, err)
+			require.EqualValues(t, tc.tdOut, tc.tdIn)
+		})
+	}
+
+}
+
+func TestLogSteps(t *testing.T) {
+	testcases := []struct {
+		n   int64
+		log string
+	}{
+		{1, "1"}, {2000, "2k"}, {1000000, "1m"}, {330000, ""}, {330001, ""},
+		{4000000, "4m"}, {40000000, "40m"}, {41000000, "41m"}, {4110000, ""},
+		{5000000000, "5b"}, {5010000000, "5.010b"}, {5011000000, "5.011b"},
+	}
+	for _, tc := range testcases {
+		t.Run(strconv.Itoa(int(tc.n)), func(t *testing.T) {
+			require.Equal(t, tc.log, logSteps(tc.n))
+		})
+	}
+}
+
+func TestVDiffPlanInclude(t *testing.T) {
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name:              "t1",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t2",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t3",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t4",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}},
+	}
+
+	df := &vdiff{}
+	rule := &binlogdatapb.Rule{
+		Match: "/.*",
+	}
+	filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{rule}}
+	var err error
+	err = df.buildVDiffPlan(context.Background(), filter, schm, []string{"t2"})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(df.differs))
+	err = df.buildVDiffPlan(context.Background(), filter, schm, []string{"t2", "t3"})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(df.differs))
+	err = df.buildVDiffPlan(context.Background(), filter, schm, []string{"t1", "t2", "t3"})
+	require.NoError(t, err)
+	require.Equal(t, 3, len(df.differs))
+	err = df.buildVDiffPlan(context.Background(), filter, schm, []string{"t1", "t2", "t3", "t4"})
+	require.NoError(t, err)
+	require.Equal(t, 4, len(df.differs))
+	err = df.buildVDiffPlan(context.Background(), filter, schm, []string{"t1", "t2", "t3", "t5"})
+	require.Error(t, err)
 }

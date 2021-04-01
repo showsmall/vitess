@@ -17,14 +17,16 @@ limitations under the License.
 package tabletserver
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/vexec"
 
 	"time"
 
@@ -47,11 +49,11 @@ type Controller interface {
 	Stats() *tabletenv.Stats
 
 	// InitDBConfig sets up the db config vars.
-	InitDBConfig(querypb.Target, *dbconfigs.DBConfigs) error
+	InitDBConfig(target querypb.Target, dbConfigs *dbconfigs.DBConfigs, mysqlDaemon mysqlctl.MysqlDaemon) error
 
 	// SetServingType transitions the query service to the required serving type.
 	// Returns true if the state of QueryService or the tablet type changed.
-	SetServingType(tabletType topodatapb.TabletType, serving bool, alsoAllow []topodatapb.TabletType) (bool, error)
+	SetServingType(tabletType topodatapb.TabletType, terTimestamp time.Time, serving bool, reason string) error
 
 	// EnterLameduck causes tabletserver to enter the lameduck state.
 	EnterLameduck()
@@ -80,15 +82,14 @@ type Controller interface {
 	// QueryService returns the QueryService object used by this Controller
 	QueryService() queryservice.QueryService
 
+	// OnlineDDLExecutor the online DDL executor used by this Controller
+	OnlineDDLExecutor() vexec.Executor
+
 	// SchemaEngine returns the SchemaEngine object used by this Controller
 	SchemaEngine() *schema.Engine
 
 	// BroadcastHealth sends the current health to all listeners
-	BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats, maxCache time.Duration)
-
-	// HeartbeatLag returns the current lag as calculated by the heartbeat
-	// package, if heartbeat is enabled. Otherwise returns 0.
-	HeartbeatLag() (time.Duration, error)
+	BroadcastHealth()
 
 	// TopoServer returns the topo server.
 	TopoServer() *topo.Server

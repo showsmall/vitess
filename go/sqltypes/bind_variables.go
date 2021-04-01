@@ -27,8 +27,16 @@ import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
-// NullBindVariable is a bindvar with NULL value.
-var NullBindVariable = &querypb.BindVariable{Type: querypb.Type_NULL_TYPE}
+var (
+	// BvSchemaName is bind variable to be sent down to vttablet for schema name.
+	BvSchemaName = "__vtschemaname"
+
+	// BvReplaceSchemaName is bind variable to be sent down to vttablet to replace schema name.
+	BvReplaceSchemaName = "__replacevtschemaname"
+
+	// NullBindVariable is a bindvar with NULL value.
+	NullBindVariable = &querypb.BindVariable{Type: querypb.Type_NULL_TYPE}
+)
 
 // ValueToProto converts Value to a *querypb.Value.
 func ValueToProto(v Value) *querypb.Value {
@@ -65,6 +73,14 @@ func Int8BindVariable(v int8) *querypb.BindVariable {
 // Int32BindVariable converts an int32 to a bind var.
 func Int32BindVariable(v int32) *querypb.BindVariable {
 	return ValueBindVariable(NewInt32(v))
+}
+
+// BoolBindVariable converts an bool to a int64 bind var.
+func BoolBindVariable(v bool) *querypb.BindVariable {
+	if v {
+		return Int64BindVariable(1)
+	}
+	return Int64BindVariable(0)
 }
 
 // Int64BindVariable converts an int64 to a bind var.
@@ -211,6 +227,22 @@ func BuildBindVariable(v interface{}) (*querypb.BindVariable, error) {
 		for i, lv := range v {
 			values[i].Type = querypb.Type_FLOAT64
 			values[i].Value = strconv.AppendFloat(nil, lv, 'g', -1, 64)
+			bv.Values[i] = &values[i]
+		}
+		return bv, nil
+	case []Value:
+		bv := &querypb.BindVariable{
+			Type:   querypb.Type_TUPLE,
+			Values: make([]*querypb.Value, len(v)),
+		}
+		values := make([]querypb.Value, len(v))
+		for i, lv := range v {
+			lbv, err := BuildBindVariable(lv)
+			if err != nil {
+				return nil, err
+			}
+			values[i].Type = lbv.Type
+			values[i].Value = lbv.Value
 			bv.Values[i] = &values[i]
 		}
 		return bv, nil

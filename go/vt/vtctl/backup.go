@@ -22,7 +22,8 @@ import (
 	"fmt"
 	"io"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -134,7 +135,7 @@ func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 			switch tablets[i].Type {
 			case topodatapb.TabletType_MASTER:
 				tabletForBackup = tablets[i].Tablet
-				secondsBehind = 0
+				secondsBehind = 0 //nolint
 				break ChooseMaster
 			default:
 				continue

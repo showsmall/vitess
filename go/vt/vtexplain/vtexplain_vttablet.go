@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
@@ -73,6 +73,8 @@ type explainTablet struct {
 	currentTime   int
 }
 
+var _ queryservice.QueryService = (*explainTablet)(nil)
+
 func newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 	db := fakesqldb.New(nil)
 
@@ -85,7 +87,7 @@ func newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 	}
 
 	// XXX much of this is cloned from the tabletserver tests
-	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), topodatapb.TabletAlias{})
+	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), *t.Alias)
 
 	tablet := explainTablet{db: db, tsv: tsv}
 	db.Handler = &tablet
@@ -108,7 +110,7 @@ func newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 		Shard:      t.Shard,
 		TabletType: topodatapb.TabletType_MASTER,
 	}
-	tsv.StartService(target, dbcfgs)
+	tsv.StartService(target, dbcfgs, nil /* mysqld */)
 
 	// clear all the schema initialization queries out of the tablet
 	// to avoid clutttering the output
@@ -134,7 +136,7 @@ func (t *explainTablet) Begin(ctx context.Context, target *querypb.Target, optio
 }
 
 // Commit is part of the QueryService interface.
-func (t *explainTablet) Commit(ctx context.Context, target *querypb.Target, transactionID int64) error {
+func (t *explainTablet) Commit(ctx context.Context, target *querypb.Target, transactionID int64) (int64, error) {
 	t.mu.Lock()
 	t.currentTime = batchTime.Wait()
 	t.tabletQueries = append(t.tabletQueries, &TabletQuery{
@@ -147,7 +149,7 @@ func (t *explainTablet) Commit(ctx context.Context, target *querypb.Target, tran
 }
 
 // Rollback is part of the QueryService interface.
-func (t *explainTablet) Rollback(ctx context.Context, target *querypb.Target, transactionID int64) error {
+func (t *explainTablet) Rollback(ctx context.Context, target *querypb.Target, transactionID int64) (int64, error) {
 	t.mu.Lock()
 	t.currentTime = batchTime.Wait()
 	t.mu.Unlock()
@@ -155,7 +157,7 @@ func (t *explainTablet) Rollback(ctx context.Context, target *querypb.Target, tr
 }
 
 // Execute is part of the QueryService interface.
-func (t *explainTablet) Execute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
+func (t *explainTablet) Execute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, transactionID, reservedID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
 	t.mu.Lock()
 	t.currentTime = batchTime.Wait()
 
@@ -169,7 +171,7 @@ func (t *explainTablet) Execute(ctx context.Context, target *querypb.Target, sql
 	})
 	t.mu.Unlock()
 
-	return t.tsv.Execute(ctx, target, sql, bindVariables, transactionID, options)
+	return t.tsv.Execute(ctx, target, sql, bindVariables, transactionID, reservedID, options)
 }
 
 // Prepare is part of the QueryService interface.
@@ -249,7 +251,7 @@ func (t *explainTablet) ExecuteBatch(ctx context.Context, target *querypb.Target
 }
 
 // BeginExecute is part of the QueryService interface.
-func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
+func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
 	t.mu.Lock()
 	t.currentTime = batchTime.Wait()
 	bindVariables = sqltypes.CopyBindVariables(bindVariables)
@@ -260,7 +262,7 @@ func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target
 	})
 	t.mu.Unlock()
 
-	return t.tsv.BeginExecute(ctx, target, sql, bindVariables, options)
+	return t.tsv.BeginExecute(ctx, target, preQueries, sql, bindVariables, reservedID, options)
 }
 
 // Close is part of the QueryService interface.
@@ -268,7 +270,7 @@ func (t *explainTablet) Close(ctx context.Context) error {
 	return t.tsv.Close(ctx)
 }
 
-func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
+func initTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) error {
 	tableColumns = make(map[string]map[string]querypb.Type)
 	schemaQueries = map[string]*sqltypes.Result{
 		"select unix_timestamp()": {
@@ -364,31 +366,47 @@ func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
+		mysql.ShowRowsRead: sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"Variable_name|value",
+				"varchar|uint64",
+			),
+			"Innodb_rows|0",
+		),
 	}
 
 	showTableRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
-		table := ddl.Table.Name.String()
-		showTableRows = append(showTableRows, mysql.BaseShowTablesRow(table, false, ""))
+		table := ddl.GetTable().Name.String()
+		options := ""
+		spec := ddl.GetTableSpec()
+		if spec != nil {
+			for _, option := range spec.Options {
+				if option.Name == "comment" && string(option.Value.Val) == "vitess_sequence" {
+					options = "vitess_sequence"
+				}
+			}
+		}
+		showTableRows = append(showTableRows, mysql.BaseShowTablesRow(table, false, options))
 	}
-	schemaQueries[mysql.BaseShowTables] = &sqltypes.Result{
+	schemaQueries[mysql.TablesWithSize57] = &sqltypes.Result{
 		Fields: mysql.BaseShowTablesFields,
 		Rows:   showTableRows,
 	}
 
 	indexRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
-		table := sqlparser.String(ddl.Table.Name)
+		table := sqlparser.String(ddl.GetTable().Name)
 
-		if ddl.OptLike != nil {
-			likeTable := ddl.OptLike.LikeTable.Name.String()
+		if ddl.GetOptLike() != nil {
+			likeTable := ddl.GetOptLike().LikeTable.Name.String()
 			if _, ok := schemaQueries["select * from "+likeTable+" where 1 != 1"]; !ok {
 				return fmt.Errorf("check your schema, table[%s] doesn't exist", likeTable)
 			}
 			schemaQueries["select * from "+table+" where 1 != 1"] = schemaQueries["select * from "+likeTable+" where 1 != 1"]
 			continue
 		}
-		for _, idx := range ddl.TableSpec.Indexes {
+		for _, idx := range ddl.GetTableSpec().Indexes {
 			if !idx.Info.Primary {
 				continue
 			}
@@ -400,7 +418,7 @@ func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
 
 		tableColumns[table] = make(map[string]querypb.Type)
 		var rowTypes []*querypb.Field
-		for _, col := range ddl.TableSpec.Columns {
+		for _, col := range ddl.GetTableSpec().Columns {
 			colName := strings.ToLower(col.Name.String())
 			rowType := &querypb.Field{
 				Name: colName,
@@ -497,30 +515,66 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 			}
 		}
 
+		// the query against lookup table is in-query, handle it specifically
+		var inColName string
+		inVal := make([][]byte, 0, 10)
+		rowCount := 1
+		if selStmt.Where != nil {
+			switch v := selStmt.Where.Expr.(type) {
+			case *sqlparser.ComparisonExpr:
+				if v.Operator == sqlparser.InOp {
+					switch c := v.Left.(type) {
+					case *sqlparser.ColName:
+						switch values := v.Right.(type) {
+						case sqlparser.ValTuple:
+							for _, val := range values {
+								switch v := val.(type) {
+								case *sqlparser.Literal:
+									inVal = append(inVal, v.Bytes())
+								}
+							}
+							rowCount = len(inVal)
+						}
+						inColName = strings.ToLower(c.Name.String())
+					}
+				}
+			}
+		}
+
 		fields := make([]*querypb.Field, len(colNames))
-		values := make([]sqltypes.Value, len(colNames))
+		rows := make([][]sqltypes.Value, 0, rowCount)
 		for i, col := range colNames {
 			colType := colTypes[i]
 			fields[i] = &querypb.Field{
 				Name: col,
 				Type: colType,
 			}
+		}
 
-			// Generate a fake value for the given column. For numeric types,
-			// use the column index. For all other types, just shortcut to using
-			// a string type that encodes the column name + index.
-			if sqltypes.IsIntegral(colType) {
-				values[i] = sqltypes.NewInt32(int32(i + 1))
-			} else if sqltypes.IsFloat(colType) {
-				values[i] = sqltypes.NewFloat64(1.0 + float64(i))
-			} else {
-				values[i] = sqltypes.NewVarChar(fmt.Sprintf("%s_val_%d", col, i+1))
+		for j := 0; j < rowCount; j++ {
+			values := make([]sqltypes.Value, len(colNames))
+			for i, col := range colNames {
+				// Generate a fake value for the given column. For the column in the IN clause,
+				// use the provided values in the query, For numeric types,
+				// use the column index. For all other types, just shortcut to using
+				// a string type that encodes the column name + index.
+				colType := colTypes[i]
+				if len(inVal) > j && col == inColName {
+					values[i], _ = sqltypes.NewValue(querypb.Type_VARBINARY, inVal[j])
+				} else if sqltypes.IsIntegral(colType) {
+					values[i] = sqltypes.NewInt32(int32(i + 1))
+				} else if sqltypes.IsFloat(colType) {
+					values[i] = sqltypes.NewFloat64(1.0 + float64(i))
+				} else {
+					values[i] = sqltypes.NewVarChar(fmt.Sprintf("%s_val_%d", col, i+1))
+				}
 			}
+			rows = append(rows, values)
 		}
 		result = &sqltypes.Result{
 			Fields:   fields,
 			InsertID: 0,
-			Rows:     [][]sqltypes.Value{values},
+			Rows:     rows,
 		}
 
 		resultJSON, _ := json.MarshalIndent(result, "", "    ")
@@ -553,7 +607,7 @@ func inferColTypeFromExpr(node sqlparser.Expr, colTypeMap map[string]querypb.Typ
 		// As a shortcut, functions are integral types
 		colNames = append(colNames, sqlparser.String(node))
 		colTypes = append(colTypes, querypb.Type_INT32)
-	case *sqlparser.SQLVal:
+	case *sqlparser.Literal:
 		colNames = append(colNames, sqlparser.String(node))
 		switch node.Type {
 		case sqlparser.IntVal:
@@ -576,6 +630,9 @@ func inferColTypeFromExpr(node sqlparser.Expr, colTypeMap map[string]querypb.Typ
 	case *sqlparser.NullVal:
 		colNames = append(colNames, sqlparser.String(node))
 		colTypes = append(colTypes, querypb.Type_NULL_TYPE)
+	case *sqlparser.ComparisonExpr:
+		colNames = append(colNames, sqlparser.String(node))
+		colTypes = append(colTypes, querypb.Type_INT64)
 	default:
 		log.Errorf("vtexplain: unsupported select expression type +%v node %s", reflect.TypeOf(node), sqlparser.String(node))
 	}

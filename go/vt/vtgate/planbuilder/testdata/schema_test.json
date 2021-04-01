@@ -2,10 +2,10 @@
   "routing_rules": {
     "rules": [{
       "from_table": "route1",
-      "to_tables": ["user.user", "user.user_metadata"]
+      "to_tables": ["user.user"]
     }, {
       "from_table": "route2",
-      "to_tables": ["user.user", "main.unsharded"]
+      "to_tables": ["main.unsharded"]
     }, {
       "from_table": "second_user.user",
       "to_tables": ["user.user"]
@@ -14,7 +14,7 @@
       "to_tables": ["user.user"]
     }, {
       "from_table": "bad_table",
-      "to_tables": ["none.none"]
+      "to_tables": ["noks.noks"]
     }, {
       "from_table": "disabled",
       "to_tables": []
@@ -110,6 +110,10 @@
             {
               "name": "textcol1",
               "type": "VARCHAR"
+            },
+            {
+              "name": "intcol",
+              "type": "INT16"
             },
             {
               "name": "textcol2",
@@ -304,6 +308,20 @@
         },
         "seq": {
           "type": "sequence"
+        }
+      }
+    },
+    "main_2": {
+      "tables": {
+        "unsharded_tab": {
+          "columns": [
+            {
+              "name": "predef1"
+            },
+            {
+              "name": "predef3"
+            }
+          ]
         }
       }
     }

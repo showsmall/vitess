@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -72,7 +73,7 @@ func TestLookupHashUniqueMap(t *testing.T) {
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("\x16k@\xb4J\xbaK\xd6")),
-		key.DestinationKeyspaceID([]byte("\x16k@\xb4J\xbaK\xd6")),
+		key.DestinationNone{},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Map(): %#v, want %+v", got, want)
@@ -98,8 +99,8 @@ func TestLookupHashUniqueMap(t *testing.T) {
 
 	// Test conversion fail.
 	vc.result = sqltypes.MakeTestResult(
-		sqltypes.MakeTestFields("a", "varbinary"),
-		"notint",
+		sqltypes.MakeTestFields("b|a", "bigint|varbinary"),
+		"1|notint",
 	)
 	got, err = lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1)})
 	require.NoError(t, err)

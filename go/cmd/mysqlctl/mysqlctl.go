@@ -23,7 +23,7 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/cmd"
 	"vitess.io/vitess/go/exit"
@@ -42,7 +42,8 @@ var (
 	tabletUID   = flag.Uint("tablet_uid", 41983, "tablet uid")
 	mysqlSocket = flag.String("mysql_socket", "", "path to the mysql socket")
 
-	tabletAddr string
+	// Reason for nolint : Being used in line 246 (tabletAddr = netutil.JoinHostPort("localhost", int32(*port))
+	tabletAddr string //nolint
 )
 
 func initConfigCmd(subFlags *flag.FlagSet, args []string) error {

@@ -22,7 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
+
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/logutil"
@@ -92,6 +94,12 @@ func (sq *verticalDiffTabletServer) StreamExecute(ctx context.Context, target *q
 // TODO(aaijazi): Create a test in which source and destination data does not match
 
 func TestVerticalSplitDiff(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ts := memorytopo.NewServer("cell1", "cell2")
 	ctx := context.Background()
 	wi := NewInstance(ts, "cell1", time.Second)
@@ -132,10 +140,10 @@ func TestVerticalSplitDiff(t *testing.T) {
 	wi.wr.SetSourceShards(ctx, "destination_ks", "0", []*topodatapb.TabletAlias{sourceRdonly1.Tablet.Alias}, []string{"moving.*", "view1"})
 
 	// add the topo and schema data we'll need
-	if err := wi.wr.RebuildKeyspaceGraph(ctx, "source_ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "source_ks", nil, false); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
-	if err := wi.wr.RebuildKeyspaceGraph(ctx, "destination_ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "destination_ks", nil, false); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
@@ -171,7 +179,8 @@ func TestVerticalSplitDiff(t *testing.T) {
 		qs := fakes.NewStreamHealthQueryService(rdonly.Target())
 		qs.AddDefaultHealthResponse()
 		grpcqueryservice.Register(rdonly.RPCServer, &verticalDiffTabletServer{
-			t:                        t,
+			t: t,
+
 			StreamHealthQueryService: qs,
 		})
 	}

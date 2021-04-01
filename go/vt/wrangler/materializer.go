@@ -18,16 +18,21 @@ package wrangler
 
 import (
 	"fmt"
+	"hash/fnv"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
-	"github.com/gogo/protobuf/proto"
-	"golang.org/x/net/context"
+	"context"
+
+	"github.com/golang/protobuf/proto"
 
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/sqltypes"
@@ -53,64 +58,143 @@ type materializer struct {
 }
 
 const (
-	createDDLAsCopy = "copy"
+	createDDLAsCopy               = "copy"
+	createDDLAsCopyDropConstraint = "copy:drop_constraint"
 )
 
 // MoveTables initiates moving table(s) over to another keyspace
-func (wr *Wrangler) MoveTables(ctx context.Context, workflow, sourceKeyspace, targetKeyspace, tableSpecs, cell, tabletTypes string) error {
+func (wr *Wrangler) MoveTables(ctx context.Context, workflow, sourceKeyspace, targetKeyspace, tableSpecs,
+	cell, tabletTypes string, allTables bool, excludeTables string, autoStart, stopAfterCopy bool,
+	externalCluster string) error {
+	//FIXME validate tableSpecs, allTables, excludeTables
 	var tables []string
+	var externalTopo *topo.Server
+	var err error
+
+	if externalCluster != "" {
+		externalTopo, err = wr.ts.OpenExternalVitessClusterServer(ctx, externalCluster)
+		if err != nil {
+			return err
+		}
+		wr.sourceTs = externalTopo
+		log.Infof("Successfully opened external topo: %+v", externalTopo)
+	}
 	var vschema *vschemapb.Keyspace
+	vschema, err = wr.ts.GetVSchema(ctx, targetKeyspace)
+	if err != nil {
+		return err
+	}
+	if vschema == nil {
+		return fmt.Errorf("no vschema found for target keyspace %s", targetKeyspace)
+	}
 	if strings.HasPrefix(tableSpecs, "{") {
+		if vschema.Tables == nil {
+			vschema.Tables = make(map[string]*vschemapb.Table)
+		}
 		wrap := fmt.Sprintf(`{"tables": %s}`, tableSpecs)
 		ks := &vschemapb.Keyspace{}
 		if err := json2.Unmarshal([]byte(wrap), ks); err != nil {
 			return err
-		}
-		var err error
-		vschema, err = wr.ts.GetVSchema(ctx, targetKeyspace)
-		if err != nil {
-			return err
-		}
-		if vschema.Tables == nil {
-			vschema.Tables = make(map[string]*vschemapb.Table)
 		}
 		for table, vtab := range ks.Tables {
 			vschema.Tables[table] = vtab
 			tables = append(tables, table)
 		}
 	} else {
-		tables = strings.Split(tableSpecs, ",")
-	}
-
-	// Save routing rules before vschema. If we save vschema first, and routing rules
-	// fails to save, we may generate duplicate table errors.
-	rules, err := wr.getRoutingRules(ctx)
-	if err != nil {
-		return err
-	}
-	for _, table := range tables {
-		rules[table] = []string{sourceKeyspace + "." + table}
-		rules[targetKeyspace+"."+table] = []string{sourceKeyspace + "." + table}
-	}
-	if err := wr.saveRoutingRules(ctx, rules); err != nil {
-		return err
-	}
-	if vschema != nil {
-		// We added to the vschema.
-		if err := wr.ts.SaveVSchema(ctx, targetKeyspace, vschema); err != nil {
+		if len(strings.TrimSpace(tableSpecs)) > 0 {
+			tables = strings.Split(tableSpecs, ",")
+		}
+		ksTables, err := wr.getKeyspaceTables(ctx, sourceKeyspace, wr.sourceTs)
+		if err != nil {
 			return err
+		}
+		if len(tables) > 0 {
+			err = wr.validateSourceTablesExist(ctx, sourceKeyspace, ksTables, tables)
+			if err != nil {
+				return err
+			}
+		} else {
+			if allTables {
+				var excludeTablesList []string
+				excludeTables = strings.TrimSpace(excludeTables)
+				if excludeTables != "" {
+					excludeTablesList = strings.Split(excludeTables, ",")
+				}
+				err = wr.validateSourceTablesExist(ctx, sourceKeyspace, ksTables, excludeTablesList)
+				if err != nil {
+					return err
+				}
+				if len(excludeTablesList) > 0 {
+					for _, ksTable := range ksTables {
+						exclude := false
+						for _, table := range excludeTablesList {
+							if ksTable == table {
+								exclude = true
+								break
+							}
+						}
+						if !exclude {
+							tables = append(tables, ksTable)
+						}
+					}
+				} else {
+					tables = ksTables
+				}
+			} else {
+				return fmt.Errorf("no tables to move")
+			}
+		}
+		log.Infof("Found tables to move: %s", strings.Join(tables, ","))
+
+		if !vschema.Sharded {
+			if vschema.Tables == nil {
+				vschema.Tables = make(map[string]*vschemapb.Table)
+			}
+			for _, table := range tables {
+				vschema.Tables[table] = &vschemapb.Table{}
+			}
+		}
+	}
+	if externalTopo == nil {
+		// Save routing rules before vschema. If we save vschema first, and routing rules
+		// fails to save, we may generate duplicate table errors.
+		rules, err := wr.getRoutingRules(ctx)
+		if err != nil {
+			return err
+		}
+		for _, table := range tables {
+			toSource := []string{sourceKeyspace + "." + table}
+			rules[table] = toSource
+			rules[table+"@replica"] = toSource
+			rules[table+"@rdonly"] = toSource
+			rules[targetKeyspace+"."+table] = toSource
+			rules[targetKeyspace+"."+table+"@replica"] = toSource
+			rules[targetKeyspace+"."+table+"@rdonly"] = toSource
+			rules[targetKeyspace+"."+table] = toSource
+			rules[sourceKeyspace+"."+table+"@replica"] = toSource
+			rules[sourceKeyspace+"."+table+"@rdonly"] = toSource
+		}
+		if err := wr.saveRoutingRules(ctx, rules); err != nil {
+			return err
+		}
+		if vschema != nil {
+			// We added to the vschema.
+			if err := wr.ts.SaveVSchema(ctx, targetKeyspace, vschema); err != nil {
+				return err
+			}
 		}
 	}
 	if err := wr.ts.RebuildSrvVSchema(ctx, nil); err != nil {
 		return err
 	}
-
 	ms := &vtctldatapb.MaterializeSettings{
-		Workflow:       workflow,
-		SourceKeyspace: sourceKeyspace,
-		TargetKeyspace: targetKeyspace,
-		Cell:           cell,
-		TabletTypes:    tabletTypes,
+		Workflow:        workflow,
+		SourceKeyspace:  sourceKeyspace,
+		TargetKeyspace:  targetKeyspace,
+		Cell:            cell,
+		TabletTypes:     tabletTypes,
+		StopAfterCopy:   stopAfterCopy,
+		ExternalCluster: externalCluster,
 	}
 	for _, table := range tables {
 		buf := sqlparser.NewTrackedBuffer(nil)
@@ -121,7 +205,135 @@ func (wr *Wrangler) MoveTables(ctx context.Context, workflow, sourceKeyspace, ta
 			CreateDdl:        createDDLAsCopy,
 		})
 	}
-	return wr.Materialize(ctx, ms)
+	mz, err := wr.prepareMaterializerStreams(ctx, ms)
+	if err != nil {
+		return err
+	}
+	tabletShards, err := wr.collectTargetStreams(ctx, mz)
+	if err != nil {
+		return err
+	}
+
+	migrationID, err := getMigrationID(targetKeyspace, tabletShards)
+	if err != nil {
+		return err
+	}
+
+	if externalCluster == "" {
+		exists, tablets, err := wr.checkIfPreviousJournalExists(ctx, mz, migrationID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			wr.Logger().Errorf("Found a previous journal entry for %d", migrationID)
+			msg := fmt.Sprintf("found an entry from a previous run for migration id %d in _vt.resharding_journal of tablets %s,",
+				migrationID, strings.Join(tablets, ","))
+			msg += fmt.Sprintf("please review and delete it before proceeding and restart the workflow using the Workflow %s.%s start",
+				workflow, targetKeyspace)
+			return fmt.Errorf(msg)
+		}
+	}
+	if autoStart {
+		return mz.startStreams(ctx)
+	}
+	wr.Logger().Infof("Streams will not be started since -auto_start is set to false")
+
+	return nil
+}
+
+func (wr *Wrangler) validateSourceTablesExist(ctx context.Context, sourceKeyspace string, ksTables, tables []string) error {
+	// validate that tables provided are present in the source keyspace
+	var missingTables []string
+	for _, table := range tables {
+		found := false
+		for _, ksTable := range ksTables {
+			if table == ksTable {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missingTables = append(missingTables, table)
+		}
+	}
+	if len(missingTables) > 0 {
+		return fmt.Errorf("table(s) not found in source keyspace %s: %s", sourceKeyspace, strings.Join(missingTables, ","))
+	}
+	return nil
+}
+
+func (wr *Wrangler) getKeyspaceTables(ctx context.Context, ks string, ts *topo.Server) ([]string, error) {
+	shards, err := ts.GetServingShards(ctx, ks)
+	if err != nil {
+		return nil, err
+	}
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("keyspace %s has no shards", ks)
+	}
+	master := shards[0].MasterAlias
+	if master == nil {
+		return nil, fmt.Errorf("shard does not have a master: %v", shards[0].ShardName())
+	}
+	allTables := []string{"/.*/"}
+
+	ti, err := ts.GetTablet(ctx, master)
+	if err != nil {
+		return nil, err
+	}
+	schema, err := wr.tmc.GetSchema(ctx, ti.Tablet, allTables, nil, false)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("got table schemas from source master %v.", master)
+
+	var sourceTables []string
+	for _, td := range schema.TableDefinitions {
+		sourceTables = append(sourceTables, td.Name)
+	}
+	return sourceTables, nil
+}
+
+func (wr *Wrangler) checkIfPreviousJournalExists(ctx context.Context, mz *materializer, migrationID int64) (bool, []string, error) {
+	forAllSources := func(f func(*topo.ShardInfo) error) error {
+		var wg sync.WaitGroup
+		allErrors := &concurrency.AllErrorRecorder{}
+		for _, sourceShard := range mz.sourceShards {
+			wg.Add(1)
+			go func(sourceShard *topo.ShardInfo) {
+				defer wg.Done()
+
+				if err := f(sourceShard); err != nil {
+					allErrors.RecordError(err)
+				}
+			}(sourceShard)
+		}
+		wg.Wait()
+		return allErrors.AggrError(vterrors.Aggregate)
+	}
+
+	var mu sync.Mutex
+	var exists bool
+	var tablets []string
+	err := forAllSources(func(si *topo.ShardInfo) error {
+		tablet, err := wr.ts.GetTablet(ctx, si.MasterAlias)
+		if err != nil {
+			return err
+		}
+		if tablet == nil {
+			return nil
+		}
+		_, exists, err = wr.checkIfJournalExistsOnTablet(ctx, tablet.Tablet, migrationID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			mu.Lock()
+			defer mu.Unlock()
+			tablets = append(tablets, tablet.AliasString())
+		}
+		return nil
+	})
+	return exists, tablets, err
 }
 
 // CreateLookupVindex creates a lookup vindex and sets up the backfill.
@@ -532,23 +744,77 @@ func (wr *Wrangler) ExternalizeVindex(ctx context.Context, qualifiedVindexName s
 	return wr.ts.SaveVSchema(ctx, sourceKeyspace, sourceVSchema)
 }
 
-// Materialize performs the steps needed to materialize a list of tables based on the materialization specs.
-func (wr *Wrangler) Materialize(ctx context.Context, ms *vtctldatapb.MaterializeSettings) error {
+//
+func (wr *Wrangler) collectTargetStreams(ctx context.Context, mz *materializer) ([]string, error) {
+	var shardTablets []string
+	var mu sync.Mutex
+	err := mz.forAllTargets(func(target *topo.ShardInfo) error {
+		var qrproto *querypb.QueryResult
+		var id int64
+		var err error
+		targetMaster, err := mz.wr.ts.GetTablet(ctx, target.MasterAlias)
+		if err != nil {
+			return vterrors.Wrapf(err, "GetTablet(%v) failed", target.MasterAlias)
+		}
+		query := fmt.Sprintf("select id from _vt.vreplication where db_name=%s and workflow=%s", encodeString(targetMaster.DbName()), encodeString(mz.ms.Workflow))
+		if qrproto, err = mz.wr.tmc.VReplicationExec(ctx, targetMaster.Tablet, query); err != nil {
+			return vterrors.Wrapf(err, "VReplicationExec(%v, %s)", targetMaster.Tablet, query)
+		}
+		qr := sqltypes.Proto3ToResult(qrproto)
+		for i := 0; i < len(qr.Rows); i++ {
+			id, err = evalengine.ToInt64(qr.Rows[i][0])
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			shardTablets = append(shardTablets, fmt.Sprintf("%s:%d", target.ShardName(), id))
+			mu.Unlock()
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return shardTablets, nil
+}
+
+// getMigrationID produces a reproducible hash based on the input parameters.
+func getMigrationID(targetKeyspace string, shardTablets []string) (int64, error) {
+	sort.Strings(shardTablets)
+	hasher := fnv.New64()
+	hasher.Write([]byte(targetKeyspace))
+	for _, str := range shardTablets {
+		hasher.Write([]byte(str))
+	}
+	// Convert to int64 after dropping the highest bit.
+	return int64(hasher.Sum64() & math.MaxInt64), nil
+}
+
+func (wr *Wrangler) prepareMaterializerStreams(ctx context.Context, ms *vtctldatapb.MaterializeSettings) (*materializer, error) {
 	if err := wr.validateNewWorkflow(ctx, ms.TargetKeyspace, ms.Workflow); err != nil {
-		return err
+		return nil, err
 	}
 	mz, err := wr.buildMaterializer(ctx, ms)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := mz.deploySchema(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	inserts, err := mz.generateInserts(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := mz.createStreams(ctx, inserts); err != nil {
+		return nil, err
+	}
+	return mz, nil
+}
+
+// Materialize performs the steps needed to materialize a list of tables based on the materialization specs.
+func (wr *Wrangler) Materialize(ctx context.Context, ms *vtctldatapb.MaterializeSettings) error {
+	mz, err := wr.prepareMaterializerStreams(ctx, ms)
+	if err != nil {
 		return err
 	}
 	return mz.startStreams(ctx)
@@ -571,7 +837,7 @@ func (wr *Wrangler) buildMaterializer(ctx context.Context, ms *vtctldatapb.Mater
 		}
 	}
 
-	sourceShards, err := wr.ts.GetServingShards(ctx, ms.SourceKeyspace)
+	sourceShards, err := wr.sourceTs.GetServingShards(ctx, ms.SourceKeyspace)
 	if err != nil {
 		return nil, err
 	}
@@ -588,43 +854,45 @@ func (wr *Wrangler) buildMaterializer(ctx context.Context, ms *vtctldatapb.Mater
 	}, nil
 }
 
+func (mz *materializer) getSourceTableDDLs(ctx context.Context) (map[string]string, error) {
+	sourceDDLs := make(map[string]string)
+	allTables := []string{"/.*/"}
+
+	sourceMaster := mz.sourceShards[0].MasterAlias
+	if sourceMaster == nil {
+		return nil, fmt.Errorf("source shard must have a master for copying schema: %v", mz.sourceShards[0].ShardName())
+	}
+
+	ti, err := mz.wr.sourceTs.GetTablet(ctx, sourceMaster)
+	if err != nil {
+		return nil, err
+	}
+	sourceSchema, err := mz.wr.tmc.GetSchema(ctx, ti.Tablet, allTables, nil, false)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, td := range sourceSchema.TableDefinitions {
+		sourceDDLs[td.Name] = td.Schema
+	}
+	return sourceDDLs, nil
+}
+
 func (mz *materializer) deploySchema(ctx context.Context) error {
+	var sourceDDLs map[string]string
+	var mu sync.Mutex
 
 	return mz.forAllTargets(func(target *topo.ShardInfo) error {
 		allTables := []string{"/.*/"}
 
 		hasTargetTable := map[string]bool{}
-		{
-			log.Infof("getting table schemas from target master %v...", target.MasterAlias)
-			targetSchema, err := mz.wr.GetSchema(ctx, target.MasterAlias, allTables, nil, false)
-			if err != nil {
-				return err
-			}
-			log.Infof("got table schemas from target master %v.", target.MasterAlias)
-
-			for _, td := range targetSchema.TableDefinitions {
-				hasTargetTable[td.Name] = true
-			}
+		targetSchema, err := mz.wr.GetSchema(ctx, target.MasterAlias, allTables, nil, false)
+		if err != nil {
+			return err
 		}
 
-		sourceDDL := map[string]string{}
-		{
-			sourceMaster := mz.sourceShards[0].MasterAlias
-			if sourceMaster == nil {
-				return fmt.Errorf("source shard must have a master for copying schema: %v", mz.sourceShards[0].ShardName())
-			}
-
-			log.Infof("getting table schemas from source master %v...", sourceMaster)
-			var err error
-			sourceSchema, err := mz.wr.GetSchema(ctx, sourceMaster, allTables, nil, false)
-			if err != nil {
-				return err
-			}
-			log.Infof("got table schemas from source master %v.", sourceMaster)
-
-			for _, td := range sourceSchema.TableDefinitions {
-				sourceDDL[td.Name] = td.Schema
-			}
+		for _, td := range targetSchema.TableDefinitions {
+			hasTargetTable[td.Name] = true
 		}
 
 		targetTablet, err := mz.wr.ts.GetTablet(ctx, target.MasterAlias)
@@ -632,7 +900,7 @@ func (mz *materializer) deploySchema(ctx context.Context) error {
 			return err
 		}
 
-		applyDDLs := []string{}
+		var applyDDLs []string
 		for _, ts := range mz.ms.TableSettings {
 			if hasTargetTable[ts.TargetTable] {
 				// Table already exists.
@@ -641,8 +909,23 @@ func (mz *materializer) deploySchema(ctx context.Context) error {
 			if ts.CreateDdl == "" {
 				return fmt.Errorf("target table %v does not exist and there is no create ddl defined", ts.TargetTable)
 			}
+
+			var err error
+			mu.Lock()
+			if len(sourceDDLs) == 0 {
+				//only get ddls for tables, once and lazily: if we need to copy the schema from source to target
+				//we copy schemas from masters on the source keyspace
+				//and we have found use cases where user just has a replica (no master) in the source keyspace
+				sourceDDLs, err = mz.getSourceTableDDLs(ctx)
+			}
+			mu.Unlock()
+			if err != nil {
+				log.Errorf("Error getting DDLs of source tables: %s", err.Error())
+				return err
+			}
+
 			createDDL := ts.CreateDdl
-			if createDDL == createDDLAsCopy {
+			if createDDL == createDDLAsCopy || createDDL == createDDLAsCopyDropConstraint {
 				if ts.SourceExpression != "" {
 					// Check for table if non-empty SourceExpression.
 					sourceTableName, err := sqlparser.TableFromStatement(ts.SourceExpression)
@@ -653,12 +936,20 @@ func (mz *materializer) deploySchema(ctx context.Context) error {
 						return fmt.Errorf("source and target table names must match for copying schema: %v vs %v", sqlparser.String(sourceTableName), ts.TargetTable)
 
 					}
-
 				}
 
-				ddl, ok := sourceDDL[ts.TargetTable]
+				ddl, ok := sourceDDLs[ts.TargetTable]
 				if !ok {
 					return fmt.Errorf("source table %v does not exist", ts.TargetTable)
+				}
+
+				if createDDL == createDDLAsCopyDropConstraint {
+					strippedDDL, err := stripTableConstraints(ddl)
+					if err != nil {
+						return err
+					}
+
+					ddl = strippedDDL
 				}
 				createDDL = ddl
 			}
@@ -667,10 +958,8 @@ func (mz *materializer) deploySchema(ctx context.Context) error {
 		}
 
 		if len(applyDDLs) > 0 {
-
 			sql := strings.Join(applyDDLs, ";\n")
 
-			log.Infof("applying schema to target tablet %v...", target.MasterAlias)
 			_, err = mz.wr.tmc.ApplySchema(ctx, targetTablet.Tablet, &tmutils.SchemaChange{
 				SQL:              sql,
 				Force:            false,
@@ -679,11 +968,32 @@ func (mz *materializer) deploySchema(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			log.Infof("applied schema to target tablet %v.", target.MasterAlias)
 		}
 
 		return nil
 	})
+}
+
+func stripTableConstraints(ddl string) (string, error) {
+	ast, err := sqlparser.ParseStrictDDL(ddl)
+	if err != nil {
+		return "", err
+	}
+
+	stripConstraints := func(cursor *sqlparser.Cursor) bool {
+		switch node := cursor.Node().(type) {
+		case sqlparser.DDLStatement:
+			if node.GetTableSpec() != nil {
+				node.GetTableSpec().Constraints = nil
+			}
+		}
+		return true
+	}
+
+	noConstraintAST := sqlparser.Rewrite(ast, stripConstraints, nil)
+	newDDL := sqlparser.String(noConstraintAST)
+
+	return newDDL, nil
 }
 
 func (mz *materializer) generateInserts(ctx context.Context) (string, error) {
@@ -691,10 +1001,11 @@ func (mz *materializer) generateInserts(ctx context.Context) (string, error) {
 
 	for _, source := range mz.sourceShards {
 		bls := &binlogdatapb.BinlogSource{
-			Keyspace:      mz.ms.SourceKeyspace,
-			Shard:         source.ShardName(),
-			Filter:        &binlogdatapb.Filter{},
-			StopAfterCopy: mz.ms.StopAfterCopy,
+			Keyspace:        mz.ms.SourceKeyspace,
+			Shard:           source.ShardName(),
+			Filter:          &binlogdatapb.Filter{},
+			StopAfterCopy:   mz.ms.StopAfterCopy,
+			ExternalCluster: mz.ms.ExternalCluster,
 		}
 		for _, ts := range mz.ms.TableSettings {
 			rule := &binlogdatapb.Rule{
@@ -735,10 +1046,10 @@ func (mz *materializer) generateInserts(ctx context.Context) (string, error) {
 					subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: mappedCol})
 				}
 				vindexName := fmt.Sprintf("%s.%s", mz.ms.TargetKeyspace, cv.Name)
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrVal([]byte(vindexName))})
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrVal([]byte("{{.keyrange}}"))})
+				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral(vindexName)})
+				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral("{{.keyrange}}")})
 				sel.Where = &sqlparser.Where{
-					Type: sqlparser.WhereStr,
+					Type: sqlparser.WhereClause,
 					Expr: &sqlparser.FuncExpr{
 						Name:  sqlparser.NewColIdent("in_keyrange"),
 						Exprs: subExprs,

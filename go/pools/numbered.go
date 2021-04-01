@@ -47,15 +47,13 @@ type unregistered struct {
 	timeUnregistered time.Time
 }
 
-func (u *unregistered) Size() int {
-	return 1
-}
-
 //NewNumbered creates a new numbered
 func NewNumbered() *Numbered {
 	n := &Numbered{
-		resources:            make(map[int64]*numberedWrapper),
-		recentlyUnregistered: cache.NewLRUCache(1000),
+		resources: make(map[int64]*numberedWrapper),
+		recentlyUnregistered: cache.NewLRUCache(1000, func(_ interface{}) int64 {
+			return 1
+		}),
 	}
 	n.empty = sync.NewCond(&n.mu)
 	return n
@@ -131,13 +129,15 @@ func (nu *Numbered) Get(id int64, purpose string) (val interface{}, err error) {
 }
 
 // Put unlocks a resource for someone else to use.
-func (nu *Numbered) Put(id int64) {
+func (nu *Numbered) Put(id int64, updateTime bool) {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()
 	if nw, ok := nu.resources[id]; ok {
 		nw.inUse = false
 		nw.purpose = ""
-		nw.timeUsed = time.Now()
+		if updateTime {
+			nw.timeUsed = time.Now()
+		}
 	}
 }
 
@@ -152,6 +152,24 @@ func (nu *Numbered) GetAll() (vals []interface{}) {
 	return vals
 }
 
+// GetByFilter returns a list of resources that match the filter.
+// It does not return any resources that are already locked.
+func (nu *Numbered) GetByFilter(purpose string, match func(val interface{}) bool) (vals []interface{}) {
+	nu.mu.Lock()
+	defer nu.mu.Unlock()
+	for _, nw := range nu.resources {
+		if nw.inUse || !nw.enforceTimeout {
+			continue
+		}
+		if match(nw.val) {
+			nw.inUse = true
+			nw.purpose = purpose
+			vals = append(vals, nw.val)
+		}
+	}
+	return vals
+}
+
 // GetOutdated returns a list of resources that are older than age, and locks them.
 // It does not return any resources that are already locked.
 func (nu *Numbered) GetOutdated(age time.Duration, purpose string) (vals []interface{}) {
@@ -162,7 +180,7 @@ func (nu *Numbered) GetOutdated(age time.Duration, purpose string) (vals []inter
 		if nw.inUse || !nw.enforceTimeout {
 			continue
 		}
-		if nw.timeCreated.Add(age).Sub(now) <= 0 {
+		if nw.timeUsed.Add(age).Sub(now) <= 0 {
 			nw.inUse = true
 			nw.purpose = purpose
 			vals = append(vals, nw.val)

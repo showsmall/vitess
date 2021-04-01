@@ -22,8 +22,10 @@ import (
 	"testing"
 	"time"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/vt/logutil"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -89,10 +91,14 @@ func (s *streamHealthTabletServer) streamHealthUnregister(id int) error {
 }
 
 // BroadcastHealth will broadcast the current health to all listeners
-func (s *streamHealthTabletServer) BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats, maxCache time.Duration) {
+func (s *streamHealthTabletServer) BroadcastHealth() {
 	shr := &querypb.StreamHealthResponse{
-		TabletExternallyReparentedTimestamp: terTimestamp,
-		RealtimeStats:                       stats,
+		TabletExternallyReparentedTimestamp: 42,
+		RealtimeStats: &querypb.RealtimeStats{
+			HealthError:         "testHealthError",
+			SecondsBehindMaster: 72,
+			CpuUsage:            1.1,
+		},
 	}
 
 	s.streamHealthMutex.Lock()
@@ -121,12 +127,6 @@ func TestTabletData(t *testing.T) {
 
 	thc := newTabletHealthCache(ts)
 
-	stats := &querypb.RealtimeStats{
-		HealthError:         "testHealthError",
-		SecondsBehindMaster: 72,
-		CpuUsage:            1.1,
-	}
-
 	// Keep broadcasting until the first result goes through.
 	stop := make(chan struct{})
 	go func() {
@@ -135,7 +135,7 @@ func TestTabletData(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				shsq.BroadcastHealth(42, stats, time.Minute)
+				shsq.BroadcastHealth()
 			}
 		}
 	}()
@@ -148,6 +148,12 @@ func TestTabletData(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("thc.Get failed: %v", err)
+	}
+
+	stats := &querypb.RealtimeStats{
+		HealthError:         "testHealthError",
+		SecondsBehindMaster: 72,
+		CpuUsage:            1.1,
 	}
 	if got, want := result.RealtimeStats, stats; !proto.Equal(got, want) {
 		t.Errorf("RealtimeStats = %#v, want %#v", got, want)

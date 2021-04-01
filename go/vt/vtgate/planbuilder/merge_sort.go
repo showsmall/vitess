@@ -17,14 +17,12 @@ limitations under the License.
 package planbuilder
 
 import (
-	"errors"
-
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
-var _ builder = (*mergeSort)(nil)
+var _ logicalPlan = (*mergeSort)(nil)
 
 // mergeSort is a pseudo-primitive. It amends the
 // the underlying Route to perform a merge sort.
@@ -54,63 +52,43 @@ func (ms *mergeSort) SetTruncateColumnCount(count int) {
 	ms.truncateColumnCount = count
 }
 
-// Primitive satisfies the builder interface.
+// Primitive implements the logicalPlan interface
 func (ms *mergeSort) Primitive() engine.Primitive {
 	return ms.input.Primitive()
 }
 
-// PushFilter satisfies the builder interface.
-func (ms *mergeSort) PushFilter(pb *primitiveBuilder, expr sqlparser.Expr, whereType string, origin builder) error {
-	return ms.input.PushFilter(pb, expr, whereType, origin)
-}
-
-// PushSelect satisfies the builder interface.
-func (ms *mergeSort) PushSelect(pb *primitiveBuilder, expr *sqlparser.AliasedExpr, origin builder) (rc *resultColumn, colNumber int, err error) {
-	return ms.input.PushSelect(pb, expr, origin)
-}
-
-// MakeDistinct satisfies the builder interface.
-func (ms *mergeSort) MakeDistinct() error {
-	return ms.input.MakeDistinct()
-}
-
-// PushGroupBy satisfies the builder interface.
-func (ms *mergeSort) PushGroupBy(groupBy sqlparser.GroupBy) error {
-	return ms.input.PushGroupBy(groupBy)
-}
-
-// PushOrderBy satisfies the builder interface.
-// A merge sort is created due to the push of an ORDER BY clause.
-// So, this function should never get called.
-func (ms *mergeSort) PushOrderBy(orderBy sqlparser.OrderBy) (builder, error) {
-	return nil, errors.New("mergeSort.PushOrderBy: unreachable")
-}
-
-// Wireup satisfies the builder interface.
-func (ms *mergeSort) Wireup(bldr builder, jt *jointab) error {
+// Wireup implements the logicalPlan interface
+func (ms *mergeSort) Wireup(plan logicalPlan, jt *jointab) error {
 	// If the route has to do the ordering, and if any columns are Text,
 	// we have to request the corresponding weight_string from mysql
 	// and use that value instead. This is because we cannot mimic
 	// mysql's collation behavior yet.
 	rb := ms.input.(*route)
-	rb.finalizeOptions()
-	ro := rb.routeOptions[0]
-	for i, orderby := range ro.eroute.OrderBy {
+	for i, orderby := range rb.eroute.OrderBy {
 		rc := ms.resultColumns[orderby.Col]
-		if sqltypes.IsText(rc.column.typ) {
+		// Add a weight_string column if we know that the column is a textual column or if its type is unknown
+		if sqltypes.IsText(rc.column.typ) || rc.column.typ == sqltypes.Null {
 			// If a weight string was previously requested, reuse it.
 			if colNumber, ok := ms.weightStrings[rc]; ok {
-				ro.eroute.OrderBy[i].Col = colNumber
+				rb.eroute.OrderBy[i].WeightStringCol = colNumber
 				continue
 			}
 			var err error
-			ro.eroute.OrderBy[i].Col, err = rb.SupplyWeightString(orderby.Col)
+			rb.eroute.OrderBy[i].WeightStringCol, err = rb.SupplyWeightString(orderby.Col)
 			if err != nil {
+				_, isUnsupportedErr := err.(UnsupportedSupplyWeightString)
+				if isUnsupportedErr {
+					continue
+				}
 				return err
 			}
 			ms.truncateColumnCount = len(ms.resultColumns)
 		}
 	}
-	ro.eroute.TruncateColumnCount = ms.truncateColumnCount
-	return ms.input.Wireup(bldr, jt)
+	rb.eroute.TruncateColumnCount = ms.truncateColumnCount
+	return ms.input.Wireup(plan, jt)
+}
+
+func (ms *mergeSort) WireupV4(semTable *semantics.SemTable) error {
+	return ms.input.WireupV4(semTable)
 }

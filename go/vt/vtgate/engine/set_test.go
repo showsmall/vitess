@@ -18,10 +18,10 @@ package engine
 
 import (
 	"fmt"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -31,6 +31,40 @@ import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
+func TestSetSystemVariableAsString(t *testing.T) {
+	setOp := SysVarReservedConn{
+		Name: "x",
+		Keyspace: &vindexes.Keyspace{
+			Name:    "ks",
+			Sharded: true,
+		},
+		Expr: "dummy_expr",
+	}
+
+	set := &Set{
+		Ops:   []SetOp{&setOp},
+		Input: &SingleRow{},
+	}
+	vc := &loggingVCursor{
+		shards: []string{"-20", "20-"},
+		results: []*sqltypes.Result{sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"id",
+				"varchar",
+			),
+			"foobar",
+		)},
+	}
+	_, err := set.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	require.NoError(t, err)
+
+	vc.ExpectLog(t, []string{
+		"ResolveDestinations ks [] Destinations:DestinationKeyspaceID(00)",
+		"ExecuteMultiShard ks.-20: select dummy_expr from dual where @@x != dummy_expr {} false false",
+		"SysVar set with (x,'foobar')",
+	})
+}
+
 func TestSetTable(t *testing.T) {
 	type testCase struct {
 		testName         string
@@ -39,12 +73,7 @@ func TestSetTable(t *testing.T) {
 		expectedQueryLog []string
 		expectedWarning  []*querypb.QueryWarning
 		expectedError    string
-	}
-
-	intExpr := func(i int) evalengine.Expr {
-		s := strconv.FormatInt(int64(i), 10)
-		e, _ := evalengine.NewLiteralInt([]byte(s))
-		return e
+		input            Primitive
 	}
 
 	tests := []testCase{
@@ -57,11 +86,41 @@ func TestSetTable(t *testing.T) {
 			setOps: []SetOp{
 				&UserDefinedVariable{
 					Name: "x",
-					Expr: intExpr(42),
+					Expr: evalengine.NewLiteralInt(42),
 				},
 			},
 			expectedQueryLog: []string{
 				`UDV set with (x,INT64(42))`,
+			},
+		},
+		{
+			testName: "udv with input",
+			setOps: []SetOp{
+				&UserDefinedVariable{
+					Name: "x",
+					Expr: evalengine.NewColumn(0),
+				},
+			},
+			qr: []*sqltypes.Result{sqltypes.MakeTestResult(
+				sqltypes.MakeTestFields(
+					"col0",
+					"datetime",
+				),
+				"2020-10-28",
+			)},
+			expectedQueryLog: []string{
+				`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
+				`ExecuteMultiShard ks.-20: select now() from dual {} false false`,
+				`UDV set with (x,DATETIME("2020-10-28"))`,
+			},
+			input: &Send{
+				Keyspace: &vindexes.Keyspace{
+					Name:    "ks",
+					Sharded: true,
+				},
+				TargetDestination: key.DestinationAnyShard{},
+				Query:             "select now() from dual",
+				SingleShardOnly:   true,
 			},
 		},
 		{
@@ -71,9 +130,6 @@ func TestSetTable(t *testing.T) {
 					Name: "x",
 					Expr: "42",
 				},
-			},
-			expectedWarning: []*querypb.QueryWarning{
-				{Code: 1235, Message: "Ignored inapplicable SET x = 42"},
 			},
 		},
 		{
@@ -100,9 +156,6 @@ func TestSetTable(t *testing.T) {
 				`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
 				`ExecuteMultiShard ks.-20: select 1 from dual where @@x = dummy_expr {} false false`,
 			},
-			expectedWarning: []*querypb.QueryWarning{
-				{Code: 1235, Message: "Ignored inapplicable SET x = dummy_expr"},
-			},
 		},
 		{
 			testName: "sysvar check and error",
@@ -120,9 +173,6 @@ func TestSetTable(t *testing.T) {
 			expectedQueryLog: []string{
 				`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
 				`ExecuteMultiShard ks.-20: select 1 from dual where @@x = dummy_expr {} false false`,
-			},
-			expectedWarning: []*querypb.QueryWarning{
-				{Code: 1235, Message: "Modification not allowed using set construct for: x"},
 			},
 		},
 		{
@@ -144,11 +194,11 @@ func TestSetTable(t *testing.T) {
 			expectedError: "Unexpected error, DestinationKeyspaceID mapping to multiple shards: DestinationAllShards()",
 		},
 		{
-			testName: "udv_ignr_chignr",
+			testName: "udv ignore checkAndIgnore ",
 			setOps: []SetOp{
 				&UserDefinedVariable{
 					Name: "x",
-					Expr: intExpr(1),
+					Expr: evalengine.NewLiteralInt(1),
 				},
 				&SysVarIgnore{
 					Name: "y",
@@ -169,10 +219,6 @@ func TestSetTable(t *testing.T) {
 				`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
 				`ExecuteMultiShard ks.-20: select 1 from dual where @@z = dummy_expr {} false false`,
 			},
-			expectedWarning: []*querypb.QueryWarning{
-				{Code: 1235, Message: "Ignored inapplicable SET y = 2"},
-				{Code: 1235, Message: "Ignored inapplicable SET z = dummy_expr"},
-			},
 			qr: []*sqltypes.Result{sqltypes.MakeTestResult(
 				sqltypes.MakeTestFields(
 					"id",
@@ -182,9 +228,9 @@ func TestSetTable(t *testing.T) {
 			)},
 		},
 		{
-			testName: "sysvar set",
+			testName: "sysvar set without destination",
 			setOps: []SetOp{
-				&SysVarSet{
+				&SysVarReservedConn{
 					Name: "x",
 					Keyspace: &vindexes.Keyspace{
 						Name:    "ks",
@@ -196,17 +242,61 @@ func TestSetTable(t *testing.T) {
 			},
 			expectedQueryLog: []string{
 				`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
-				`ExecuteMultiShard ks.-20: select dummy_expr from dual where false {} false false`,
-				`SysVar set with (x,dummy_expr)`,
+				`ExecuteMultiShard ks.-20: set @@x = dummy_expr {} false false`,
 			},
+		},
+		{
+			testName: "sysvar set not modifying setting",
+			setOps: []SetOp{
+				&SysVarReservedConn{
+					Name: "x",
+					Keyspace: &vindexes.Keyspace{
+						Name:    "ks",
+						Sharded: true,
+					},
+					Expr: "dummy_expr",
+				},
+			},
+			expectedQueryLog: []string{
+				`ResolveDestinations ks [] Destinations:DestinationKeyspaceID(00)`,
+				`ExecuteMultiShard ks.-20: select dummy_expr from dual where @@x != dummy_expr {} false false`,
+			},
+		},
+		{
+			testName: "sysvar set modifying setting",
+			setOps: []SetOp{
+				&SysVarReservedConn{
+					Name: "x",
+					Keyspace: &vindexes.Keyspace{
+						Name:    "ks",
+						Sharded: true,
+					},
+					Expr: "dummy_expr",
+				},
+			},
+			expectedQueryLog: []string{
+				`ResolveDestinations ks [] Destinations:DestinationKeyspaceID(00)`,
+				`ExecuteMultiShard ks.-20: select dummy_expr from dual where @@x != dummy_expr {} false false`,
+				`SysVar set with (x,123456)`,
+			},
+			qr: []*sqltypes.Result{sqltypes.MakeTestResult(
+				sqltypes.MakeTestFields(
+					"id",
+					"int64",
+				),
+				"123456",
+			)},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.testName, func(t *testing.T) {
+			if tc.input == nil {
+				tc.input = &SingleRow{}
+			}
 			set := &Set{
 				Ops:   tc.setOps,
-				Input: &SingleRow{},
+				Input: tc.input,
 			}
 			vc := &loggingVCursor{
 				shards:  []string{"-20", "20-"},
@@ -226,9 +316,8 @@ func TestSetTable(t *testing.T) {
 }
 
 func TestSysVarSetErr(t *testing.T) {
-
 	setOps := []SetOp{
-		&SysVarSet{
+		&SysVarReservedConn{
 			Name: "x",
 			Keyspace: &vindexes.Keyspace{
 				Name:    "ks",
@@ -241,7 +330,7 @@ func TestSysVarSetErr(t *testing.T) {
 
 	expectedQueryLog := []string{
 		`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
-		`ExecuteMultiShard ks.-20: select dummy_expr from dual where false {} false false`,
+		`ExecuteMultiShard ks.-20: set @@x = dummy_expr {} false false`,
 	}
 
 	set := &Set{

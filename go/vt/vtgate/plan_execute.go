@@ -43,7 +43,7 @@ func (e *Executor) newExecute(ctx context.Context, safeSession *SafeSession, sql
 	}
 
 	query, comments := sqlparser.SplitMarginComments(sql)
-	vcursor, err := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver)
+	vcursor, err := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver, e.serv, e.warnShardedOnly)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -60,7 +60,7 @@ func (e *Executor) newExecute(ctx context.Context, safeSession *SafeSession, sql
 	if err == planbuilder.ErrPlanNotSupported {
 		return 0, nil, err
 	}
-	execStart := e.logPlanningFinished(logStats, sql)
+	execStart := e.logPlanningFinished(logStats, plan)
 
 	if err != nil {
 		safeSession.ClearWarnings()
@@ -71,11 +71,16 @@ func (e *Executor) newExecute(ctx context.Context, safeSession *SafeSession, sql
 		safeSession.ClearWarnings()
 	}
 
+	// add any warnings that the planner wants to add
+	for _, warning := range plan.Warnings {
+		safeSession.RecordWarning(warning)
+	}
+
 	// We need to explicitly handle errors, and begin/commit/rollback, since these control transactions. Everything else
 	// will fall through and be handled through planning
 	switch plan.Type {
 	case sqlparser.StmtBegin:
-		qr, err := e.handleBegin(ctx, safeSession, vcursor.tabletType, logStats)
+		qr, err := e.handleBegin(ctx, safeSession, logStats)
 		return sqlparser.StmtBegin, qr, err
 	case sqlparser.StmtCommit:
 		qr, err := e.handleCommit(ctx, safeSession, logStats)
@@ -83,6 +88,24 @@ func (e *Executor) newExecute(ctx context.Context, safeSession *SafeSession, sql
 	case sqlparser.StmtRollback:
 		qr, err := e.handleRollback(ctx, safeSession, logStats)
 		return sqlparser.StmtRollback, qr, err
+	case sqlparser.StmtSavepoint:
+		qr, err := e.handleSavepoint(ctx, safeSession, plan.Original, "Savepoint", logStats, func(_ string) (*sqltypes.Result, error) {
+			// Safely to ignore as there is no transaction.
+			return &sqltypes.Result{}, nil
+		}, vcursor.ignoreMaxMemoryRows)
+		return sqlparser.StmtSavepoint, qr, err
+	case sqlparser.StmtSRollback:
+		qr, err := e.handleSavepoint(ctx, safeSession, plan.Original, "Rollback Savepoint", logStats, func(query string) (*sqltypes.Result, error) {
+			// Error as there is no transaction, so there is no savepoint that exists.
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.SPDoesNotExist, "SAVEPOINT does not exist: %s", query)
+		}, vcursor.ignoreMaxMemoryRows)
+		return sqlparser.StmtSRollback, qr, err
+	case sqlparser.StmtRelease:
+		qr, err := e.handleSavepoint(ctx, safeSession, plan.Original, "Release Savepoint", logStats, func(query string) (*sqltypes.Result, error) {
+			// Error as there is no transaction, so there is no savepoint that exists.
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.SPDoesNotExist, "SAVEPOINT does not exist: %s", query)
+		}, vcursor.ignoreMaxMemoryRows)
+		return sqlparser.StmtRelease, qr, err
 	}
 
 	// 3: Prepare for execution
@@ -159,7 +182,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *engine.Plan, vcursor *
 		logStats.Table = plan.Instructions.GetTableName()
 		logStats.TabletType = vcursor.TabletType().String()
 		errCount := e.logExecutionEnd(logStats, execStart, plan, err, qr)
-		plan.AddStats(1, time.Since(logStats.StartTime), uint64(logStats.ShardQueries), logStats.RowsAffected, errCount)
+		plan.AddStats(1, time.Since(logStats.StartTime), uint64(logStats.ShardQueries), logStats.RowsAffected, logStats.RowsReturned, errCount)
 
 		// Check if there was partial DML execution. If so, rollback the transaction.
 		if err != nil && safeSession.InTransaction() && vcursor.rollbackOnPartialExec {
@@ -181,13 +204,16 @@ func (e *Executor) logExecutionEnd(logStats *LogStats, execStart time.Time, plan
 		errCount = 1
 	} else {
 		logStats.RowsAffected = qr.RowsAffected
+		logStats.RowsReturned = uint64(len(qr.Rows))
 	}
 	return errCount
 }
 
-func (e *Executor) logPlanningFinished(logStats *LogStats, sql string) time.Time {
+func (e *Executor) logPlanningFinished(logStats *LogStats, plan *engine.Plan) time.Time {
 	execStart := time.Now()
-	logStats.StmtType = sqlparser.Preview(sql).String()
+	if plan != nil {
+		logStats.StmtType = plan.Type.String()
+	}
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	return execStart
 }

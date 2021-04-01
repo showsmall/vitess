@@ -19,7 +19,8 @@ package vreplication
 import (
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -88,14 +89,15 @@ func (ec *externalConnector) Get(name string) (*mysqlConnector, error) {
 	c := &mysqlConnector{}
 	c.env = tabletenv.NewEnv(config, name)
 	c.se = schema.NewEngine(c.env)
-	c.vstreamer = vstreamer.NewEngine(c.env, nil, c.se)
-	c.se.InitDBConfig(c.env.Config().DB.DbaWithDB())
+	c.vstreamer = vstreamer.NewEngine(c.env, nil, c.se, nil, "")
+	c.vstreamer.InitDBConfig("")
+	c.se.InitDBConfig(c.env.Config().DB.AllPrivsWithDB())
 
 	// Open
 	if err := c.se.Open(); err != nil {
 		return nil, vterrors.Wrapf(err, "external mysqlConnector: %v", name)
 	}
-	c.vstreamer.Open("", "")
+	c.vstreamer.Open()
 
 	// Register
 	ec.connectors[name] = c

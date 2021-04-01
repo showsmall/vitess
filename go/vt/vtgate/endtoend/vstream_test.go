@@ -23,8 +23,11 @@ import (
 	"sync"
 	"testing"
 
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
@@ -78,7 +81,8 @@ func TestVStream(t *testing.T) {
 			Match: "/.*/",
 		}},
 	}
-	reader, err := gconn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter)
+	flags := &vtgatepb.VStreamFlags{}
+	reader, err := gconn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter, flags)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,8 +124,19 @@ func TestVStream(t *testing.T) {
 				Type: querypb.Type_INT64,
 			}},
 		}
+
 		gotFields := events[1].FieldEvent
-		if !proto.Equal(gotFields, wantFields) {
+		filteredFields := &binlogdatapb.FieldEvent{
+			TableName: gotFields.TableName,
+			Fields:    []*querypb.Field{},
+		}
+		for _, field := range gotFields.Fields {
+			filteredFields.Fields = append(filteredFields.Fields, &querypb.Field{
+				Name: field.Name,
+				Type: field.Type,
+			})
+		}
+		if !proto.Equal(filteredFields, wantFields) {
 			t.Errorf("FieldEvent:\n%v, want\n%v", gotFields, wantFields)
 		}
 		wantRows := &binlogdatapb.RowEvent{
@@ -182,7 +197,8 @@ func TestVStreamCopyBasic(t *testing.T) {
 			Filter: "select * from t1",
 		}},
 	}
-	reader, err := gconn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter)
+	flags := &vtgatepb.VStreamFlags{}
+	reader, err := gconn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter, flags)
 	_, _ = conn, mconn
 	if err != nil {
 		t.Fatal(err)
@@ -200,6 +216,60 @@ func TestVStreamCopyBasic(t *testing.T) {
 				return
 			}
 			printEvents(evs) // for debugging ci failures
+		case io.EOF:
+			log.Infof("stream ended\n")
+			cancel()
+		default:
+			log.Errorf("Returned err %v", err)
+			t.Fatalf("remote error: %v\n", err)
+		}
+	}
+}
+
+func TestVStreamCurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gconn, conn, mconn, closeConnections := initialize(ctx, t)
+	defer closeConnections()
+
+	var shardGtids []*binlogdatapb.ShardGtid
+	var vgtid = &binlogdatapb.VGtid{}
+	shardGtids = append(shardGtids, &binlogdatapb.ShardGtid{
+		Keyspace: "ks",
+		Shard:    "-80",
+		Gtid:     "current",
+	})
+	shardGtids = append(shardGtids, &binlogdatapb.ShardGtid{
+		Keyspace: "ks",
+		Shard:    "80-",
+		Gtid:     "current",
+	})
+	vgtid.ShardGtids = shardGtids
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "t1",
+			Filter: "select * from t1",
+		}},
+	}
+	flags := &vtgatepb.VStreamFlags{}
+	reader, err := gconn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter, flags)
+	_, _ = conn, mconn
+	if err != nil {
+		t.Fatal(err)
+	}
+	numExpectedEvents := 4 // vgtid+other per shard for "current"
+	require.NotNil(t, reader)
+	var evs []*binlogdatapb.VEvent
+	for {
+		e, err := reader.Recv()
+		switch err {
+		case nil:
+			evs = append(evs, e...)
+			printEvents(evs) // for debugging ci failures
+			if len(evs) == numExpectedEvents {
+				t.Logf("TestVStreamCurrent was successful")
+				return
+			}
 		case io.EOF:
 			log.Infof("stream ended\n")
 			cancel()

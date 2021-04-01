@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"testing"
 
+	"vitess.io/vitess/go/test/utils"
+
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/stretchr/testify/assert"
@@ -31,481 +33,6 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 )
-
-func TestConsistentLookup(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn.Close()
-	// conn2 is for queries that target shards.
-	conn2, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn2.Close()
-
-	// Simple insert.
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
-	exec(t, conn, "commit")
-	qr := exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Inserting again should fail.
-	exec(t, conn, "begin")
-	_, err = conn.ExecuteFetch("insert into t1(id1, id2) values(1, 4)", 1000, false)
-	exec(t, conn, "rollback")
-	require.Error(t, err)
-	mysqlErr := err.(*mysql.SQLError)
-	assert.Equal(t, 1062, mysqlErr.Num)
-	assert.Equal(t, "23000", mysqlErr.State)
-	assert.Contains(t, mysqlErr.Message, "Duplicate entry")
-
-	// Simple delete.
-	exec(t, conn, "begin")
-	exec(t, conn, "delete from t1 where id1=1")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Autocommit insert.
-	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select id2 from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	// Autocommit delete.
-	exec(t, conn, "delete from t1 where id1=1")
-
-	// Dangling row pointing to existing keyspace id.
-	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
-	// Delete the main row only.
-	exec(t, conn2, "use `ks:-80`")
-	exec(t, conn2, "delete from t1 where id1=1")
-	// Verify the lookup row is still there.
-	qr = exec(t, conn, "select id2 from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	// Insert should still succeed.
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	// Lookup row should be unchanged.
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Dangling row not pointing to existing keyspace id.
-	exec(t, conn2, "use `ks:-80`")
-	exec(t, conn2, "delete from t1 where id1=1")
-	// Update the lookup row with bogus keyspace id.
-	exec(t, conn, "update t1_id2_idx set keyspace_id='aaa' where id2=4")
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"aaa\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	// Insert should still succeed.
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	// lookup row must be updated.
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Update, but don't change anything. This should not deadlock.
-	exec(t, conn, "begin")
-	exec(t, conn, "update t1 set id2=4 where id1=1")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Update, and change the lookup value. This should change main and lookup rows.
-	exec(t, conn, "begin")
-	exec(t, conn, "update t1 set id2=5 where id1=1")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(5)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(5) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	exec(t, conn, "delete from t1 where id1=1")
-}
-
-func TestDMLScatter(t *testing.T) {
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	/* Simple insert. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	1 2 3
-	2 2 3
-	3 4 3
-	4 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 2
-	3 2
-	3 4
-	4 5
-	*/
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t3(id5, id6, id7) values(1, 2, 3), (2, 2, 3), (3, 4, 3), (4, 5, 4)")
-	exec(t, conn, "commit")
-	qr := exec(t, conn, "select id5, id6, id7 from t3 order by id5")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(3)] [INT64(2) INT64(2) INT64(3)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a non lookup column. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	42 2 3
-	2 2 3
-	3 4 3
-	4 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 2
-	3 2
-	3 4
-	4 5
-	*/
-	exec(t, conn, "update t3 set id5 = 42 where id5 = 1")
-	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(2) INT64(2) INT64(3)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)] [INT64(42) INT64(2) INT64(3)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a lookup column. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	42 2 42
-	2 2 42
-	3 4 3
-	4 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	42 2
-	42 2
-	3 4
-	4 5
-	*/
-	exec(t, conn, "begin")
-	exec(t, conn, "update t3 set id7 = 42 where id6 = 2")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(2) INT64(2) INT64(42)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)] [INT64(42) INT64(2) INT64(42)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* delete one specific keyspace id. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	3 4 3
-	4 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 4
-	4 5
-	*/
-	exec(t, conn, "delete from t3 where id6 = 2")
-	qr = exec(t, conn, "select * from t3 where id6 = 2")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t3_id7_idx where id6 = 2")
-	require.Empty(t, qr.Rows)
-
-	// delete all the rows.
-	exec(t, conn, "delete from t3")
-	qr = exec(t, conn, "select * from t3")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t3_id7_idx")
-	require.Empty(t, qr.Rows)
-}
-
-func TestDMLIn(t *testing.T) {
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	/* Simple insert. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	1 2 3
-	2 2 3
-	3 4 3
-	4 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 2
-	3 2
-	3 4
-	4 5
-	*/
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t3(id5, id6, id7) values(1, 2, 3), (2, 2, 3), (3, 4, 3), (4, 5, 4)")
-	exec(t, conn, "commit")
-	qr := exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(3)] [INT64(2) INT64(2) INT64(3)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a non lookup column. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	1 2 3
-	2 2 3
-	42 4 3
-	42 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 2
-	3 2
-	3 4
-	4 5
-	*/
-	exec(t, conn, "update t3 set id5 = 42 where id6 in (4, 5)")
-	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(3)] [INT64(2) INT64(2) INT64(3)] [INT64(42) INT64(4) INT64(3)] [INT64(42) INT64(5) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a non lookup column. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	1 2 42
-	2 2 42
-	42 4 3
-	42 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	42 2
-	42 2
-	3 4
-	42 5
-	*/
-	exec(t, conn, "begin")
-	exec(t, conn, "update t3 set id7 = 42 where id6 in (2, 5)")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(42)] [INT64(2) INT64(2) INT64(42)] [INT64(42) INT64(4) INT64(3)] [INT64(42) INT64(5) INT64(42)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a non lookup column. after this dml, the tables will contain the following:
-	t3 (id5, id6, id7):
-	42 4 3
-	42 5 4
-
-	t3_id7_idx (id7, keyspace_id:id6):
-	3 4
-	42 5
-	*/
-	exec(t, conn, "delete from t3 where id6 in (2)")
-	qr = exec(t, conn, "select * from t3 where id6 = 2")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t3_id7_idx where id6 = 2")
-	require.Empty(t, qr.Rows)
-
-	// delete all the rows.
-	exec(t, conn, "delete from t3 where id6 in (4, 5)")
-	qr = exec(t, conn, "select * from t3")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t3_id7_idx")
-	require.Empty(t, qr.Rows)
-}
-
-func TestConsistentLookupMultiInsert(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn.Close()
-	// conn2 is for queries that target shards.
-	conn2, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn2.Close()
-
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t1(id1, id2) values(1,4), (2,5)")
-	exec(t, conn, "commit")
-	qr := exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)] [INT64(2) INT64(5)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select count(*) from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(2)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Delete one row but leave its lookup dangling.
-	exec(t, conn2, "use `ks:-80`")
-	exec(t, conn2, "delete from t1 where id1=1")
-	// Insert a bogus lookup row.
-	exec(t, conn, "insert into t1_id2_idx(id2, keyspace_id) values(6, 'aaa')")
-	// Insert 3 rows:
-	// first row will insert without changing lookup.
-	// second will insert and change lookup.
-	// third will be a fresh insert for main and lookup.
-	exec(t, conn, "begin")
-	exec(t, conn, "insert into t1(id1, id2) values(1,2), (3,6), (4,7)")
-	exec(t, conn, "commit")
-	qr = exec(t, conn, "select id1, id2 from t1 order by id1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2)] [INT64(2) INT64(5)] [INT64(3) INT64(6)] [INT64(4) INT64(7)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx where id2=6")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(6) VARBINARY(\"N\\xb1\\x90ɢ\\xfa\\x16\\x9c\")]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select count(*) from t1_id2_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(5)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	exec(t, conn, "delete from t1 where id1=1")
-	exec(t, conn, "delete from t1 where id1=2")
-	exec(t, conn, "delete from t1 where id1=3")
-	exec(t, conn, "delete from t1 where id1=4")
-	exec(t, conn, "delete from t1_id2_idx where id2=4")
-}
-
-func TestHashLookupMultiInsertIgnore(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn.Close()
-	// conn2 is for queries that target shards.
-	conn2, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
-	defer conn2.Close()
-
-	// DB should start out clean
-	qr := exec(t, conn, "select count(*) from t2_id4_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(0)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select count(*) from t2")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(0)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	// Try inserting a bunch of ids at once
-	exec(t, conn, "begin")
-	exec(t, conn, "insert ignore into t2(id3, id4) values(50,60), (30,40), (10,20)")
-	exec(t, conn, "commit")
-
-	// Verify
-	qr = exec(t, conn, "select id3, id4 from t2 order by id3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select id3, id4 from t2_id4_idx order by id3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-}
-
-func TestConsistentLookupUpdate(t *testing.T) {
-	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &vtParams)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	/* Simple insert. after this dml, the tables will contain the following:
-	t4 (id1, id2):
-	1 2
-	2 2
-	3 3
-	4 3
-
-	t4_id2_idx (id2, id1, keyspace_id:id1):
-	2 1 1
-	2 2 2
-	3 3 3
-	3 4 4
-	*/
-	exec(t, conn, "insert into t4(id1, id2) values(1, '2'), (2, '2'), (3, '3'), (4, '3')")
-	qr := exec(t, conn, "select id1, id2 from t4 order by id1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(1) VARCHAR("2")] [INT64(2) VARCHAR("2")] [INT64(3) VARCHAR("3")] [INT64(4) VARCHAR("3")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* Updating a lookup column. after this dml, the tables will contain the following:
-	t4 (id1, id2):
-	1 42
-	2 2
-	3 3
-	4 3
-
-	t4_id2_idx (id2, id1, keyspace_id:id1):
-	42 1 1
-	2 2 2
-	3 3 3
-	3 4 4
-	*/
-	exec(t, conn, "update t4 set id2 = '42' where id1 = 1")
-	qr = exec(t, conn, "select id1, id2 from t4 order by id1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(1) VARCHAR("42")] [INT64(2) VARCHAR("2")] [INT64(3) VARCHAR("3")] [INT64(4) VARCHAR("3")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-
-	/* delete one specific keyspace id. after this dml, the tables will contain the following:
-	t4 (id1, id2):
-	2 2
-	3 3
-	4 3
-
-	t4_id2_idx (id2, id1, keyspace_id:id1):
-	2 2 2
-	3 3 3
-	3 4 4
-	*/
-	exec(t, conn, "delete from t4 where id2 = '42'")
-	qr = exec(t, conn, "select * from t4 where id2 = '42'")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t4_id2_idx where id2 = '42'")
-	require.Empty(t, qr.Rows)
-
-	// delete all the rows.
-	exec(t, conn, "delete from t4")
-	qr = exec(t, conn, "select * from t4")
-	require.Empty(t, qr.Rows)
-	qr = exec(t, conn, "select * from t4_id2_idx")
-	require.Empty(t, qr.Rows)
-}
 
 func TestSelectNull(t *testing.T) {
 	ctx := context.Background()
@@ -550,12 +77,155 @@ func TestShowColumns(t *testing.T) {
 	assertMatches(t, conn, "SHOW columns FROM `t5_null_vindex` in `ks`", expected)
 }
 
+func TestShowTables(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	query := "show tables;"
+	qr := exec(t, conn, query)
+
+	assert.Equal(t, "information_schema", qr.Fields[0].Database)
+	assert.Equal(t, "Tables_in_ks", qr.Fields[0].Name)
+}
+
 func TestCastConvert(t *testing.T) {
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
 
 	assertMatches(t, conn, `SELECT CAST("test" AS CHAR(60))`, `[[VARCHAR("test")]]`)
+}
+
+func TestCompositeIN(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// clean up before & after
+	exec(t, conn, "delete from t1")
+	defer exec(t, conn, "delete from t1")
+
+	exec(t, conn, "insert into t1(id1, id2) values(1, 2), (4, 5)")
+
+	// Just check for correct results. Plan generation is tested in unit tests.
+	assertMatches(t, conn, "select id1 from t1 where (id1, id2) in ((1, 2))", "[[INT64(1)]]")
+}
+
+func TestUnionAll(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// clean up before & after
+	exec(t, conn, "delete from t1")
+	exec(t, conn, "delete from t2")
+	defer exec(t, conn, "delete from t1")
+	defer exec(t, conn, "delete from t2")
+
+	exec(t, conn, "insert into t1(id1, id2) values(1, 1), (2, 2)")
+	exec(t, conn, "insert into t2(id3, id4) values(3, 3), (4, 4)")
+
+	// union all between two selectuniqueequal
+	assertMatches(t, conn, "select id1 from t1 where id1 = 1 union all select id1 from t1 where id1 = 4", "[[INT64(1)]]")
+
+	// union all between two different tables
+	assertMatches(t, conn, "(select id1,id2 from t1 order by id1) union all (select id3,id4 from t2 order by id3)",
+		"[[INT64(1) INT64(1)] [INT64(2) INT64(2)] [INT64(3) INT64(3)] [INT64(4) INT64(4)]]")
+
+	// union all between two different tables
+	result := exec(t, conn, "(select id1,id2 from t1) union all (select id3,id4 from t2)")
+	assert.Equal(t, 4, len(result.Rows))
+
+	// union all between two different tables
+	assertMatches(t, conn, "select tbl2.id1 FROM  ((select id1 from t1 order by id1 limit 5) union all (select id1 from t1 order by id1 desc limit 5)) as tbl1 INNER JOIN t1 as tbl2  ON tbl1.id1 = tbl2.id1",
+		"[[INT64(1)] [INT64(2)] [INT64(2)] [INT64(1)]]")
+
+	exec(t, conn, "insert into t1(id1, id2) values(3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8)")
+
+	// union all between two selectuniquein tables
+	assertMatchesNoOrder(t, conn, "select id1 from t1 where id1 in (1, 2, 3, 4, 5, 6, 7, 8) union all select id1 from t1 where id1 in (1, 2, 3, 4, 5, 6, 7, 8)",
+		"[[INT64(1)] [INT64(2)] [INT64(3)] [INT64(5)] [INT64(4)] [INT64(6)] [INT64(7)] [INT64(8)] [INT64(1)] [INT64(2)] [INT64(3)] [INT64(5)] [INT64(4)] [INT64(6)] [INT64(7)] [INT64(8)]]")
+}
+
+func TestUnionDistinct(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// clean up before & after
+	exec(t, conn, "delete from t1")
+	exec(t, conn, "delete from t2")
+	defer func() {
+		exec(t, conn, "set workload = oltp")
+		exec(t, conn, "delete from t1")
+		exec(t, conn, "delete from t2")
+	}()
+
+	exec(t, conn, "insert into t1(id1, id2) values (1, 1), (2, 2), (3,3), (4,4)")
+	exec(t, conn, "insert into t2(id3, id4) values (2, 3), (3, 4), (4,4), (5,5)")
+
+	for _, workload := range []string{"oltp", "olap"} {
+		t.Run(workload, func(t *testing.T) {
+			exec(t, conn, "set workload = "+workload)
+			assertMatches(t, conn, "select 1 union select null", "[[INT64(1)] [NULL]]")
+			assertMatches(t, conn, "select null union select null", "[[NULL]]")
+			assertMatches(t, conn, "select * from (select 1 as col union select 2) as t", "[[INT64(1)] [INT64(2)]]")
+			assertMatches(t, conn, "select 1 from dual where 1 IN (select 1 as col union select 2)", "[[INT64(1)]]")
+
+			// test with real data coming from mysql
+			assertMatches(t, conn, "select id1 from t1 where id1 = 1 union select id1 from t1 where id1 = 5", "[[INT64(1)]]")
+			assertMatchesNoOrder(t, conn, "select id1 from t1 where id1 = 1 union select id1 from t1 where id1 = 4", "[[INT64(1)] [INT64(4)]]")
+			assertMatchesNoOrder(t, conn, "select id1 from t1 where id1 = 1 union select 452 union select id1 from t1 where id1 = 4", "[[INT64(1)] [INT64(452)] [INT64(4)]]")
+			assertMatchesNoOrder(t, conn, "select id1, id2 from t1 union select 827, 452 union select id3,id4 from t2",
+				"[[INT64(4) INT64(4)] [INT64(1) INT64(1)] [INT64(2) INT64(2)] [INT64(3) INT64(3)] [INT64(827) INT64(452)] [INT64(2) INT64(3)] [INT64(3) INT64(4)] [INT64(5) INT64(5)]]")
+		})
+	}
+}
+
+func TestUnionAllOlap(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// clean up before & after
+	exec(t, conn, "delete from t1")
+	exec(t, conn, "delete from t2")
+	defer func() {
+		exec(t, conn, "set workload = oltp")
+		exec(t, conn, "delete from t1")
+		exec(t, conn, "delete from t2")
+	}()
+
+	exec(t, conn, "insert into t1(id1, id2) values(1, 1), (2, 2)")
+	exec(t, conn, "insert into t2(id3, id4) values(3, 3), (4, 4)")
+
+	exec(t, conn, "set workload = olap")
+
+	// union all between two selectuniqueequal
+	assertMatches(t, conn, "select id1 from t1 where id1 = 1 union all select id1 from t1 where id1 = 4", "[[INT64(1)]]")
+
+	// union all between two different tables
+	// union all between two different tables
+	result := exec(t, conn, "(select id1,id2 from t1 order by id1) union all (select id3,id4 from t2 order by id3)")
+	assert.Equal(t, 4, len(result.Rows))
+
+	// union all between two different tables
+	result = exec(t, conn, "(select id1,id2 from t1) union all (select id3,id4 from t2)")
+	assert.Equal(t, 4, len(result.Rows))
+
+	// union all between two different tables
+	result = exec(t, conn, "select tbl2.id1 FROM ((select id1 from t1 order by id1 limit 5) union all (select id1 from t1 order by id1 desc limit 5)) as tbl1 INNER JOIN t1 as tbl2  ON tbl1.id1 = tbl2.id1")
+	assert.Equal(t, 4, len(result.Rows))
+
+	exec(t, conn, "set workload = oltp")
+	exec(t, conn, "insert into t1(id1, id2) values(3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8)")
+	exec(t, conn, "set workload = olap")
+
+	// union all between two selectuniquein tables
+	assertMatchesNoOrder(t, conn, "select id1 from t1 where id1 in (1, 2, 3, 4, 5, 6, 7, 8) union all select id1 from t1 where id1 in (1, 2, 3, 4, 5, 6, 7, 8)",
+		"[[INT64(1)] [INT64(2)] [INT64(3)] [INT64(5)] [INT64(4)] [INT64(6)] [INT64(7)] [INT64(8)] [INT64(1)] [INT64(2)] [INT64(3)] [INT64(5)] [INT64(4)] [INT64(6)] [INT64(7)] [INT64(8)]]")
+
 }
 
 func TestUnion(t *testing.T) {
@@ -569,7 +239,360 @@ func TestUnion(t *testing.T) {
 	assertMatches(t, conn, `SELECT 1,'a' UNION ALL SELECT 1,'a' UNION ALL SELECT 1,'a' ORDER BY 1`, `[[INT64(1) VARCHAR("a")] [INT64(1) VARCHAR("a")] [INT64(1) VARCHAR("a")]]`)
 	assertMatches(t, conn, `(SELECT 1,'a') UNION ALL (SELECT 1,'a') UNION ALL (SELECT 1,'a') ORDER BY 1`, `[[INT64(1) VARCHAR("a")] [INT64(1) VARCHAR("a")] [INT64(1) VARCHAR("a")]]`)
 	assertMatches(t, conn, `(SELECT 1,'a') ORDER BY 1`, `[[INT64(1) VARCHAR("a")]]`)
-	assertMatches(t, conn, `(SELECT 1,'a' order by 1) union SELECT 1,'a' ORDER BY 1`, `[[INT64(1) VARCHAR("a")]]`)
+	assertMatches(t, conn, `(SELECT 1,'a' order by 1) union (SELECT 1,'a' ORDER BY 1)`, `[[INT64(1) VARCHAR("a")]]`)
+}
+
+func TestSavepointInTx(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "savepoint a")
+	exec(t, conn, "start transaction")
+	exec(t, conn, "savepoint b")
+	exec(t, conn, "rollback to b")
+	exec(t, conn, "release savepoint b")
+	exec(t, conn, "savepoint b")
+	exec(t, conn, "insert into t1(id1, id2) values(1,1)") // -80
+	exec(t, conn, "savepoint c")
+	exec(t, conn, "insert into t1(id1, id2) values(4,4)") // 80-
+	exec(t, conn, "savepoint d")
+	exec(t, conn, "insert into t1(id1, id2) values(2,2)") // -80
+	exec(t, conn, "savepoint e")
+
+	// Validate all the data.
+	exec(t, conn, "use `ks:-80`")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)]]`)
+	exec(t, conn, "use `ks:80-`")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(4)]]`)
+	exec(t, conn, "use")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)] [INT64(4)]]`)
+
+	_, err = conn.ExecuteFetch("rollback work to savepoint a", 1000, true)
+	require.Error(t, err)
+
+	exec(t, conn, "release savepoint d")
+
+	_, err = conn.ExecuteFetch("rollback to d", 1000, true)
+	require.Error(t, err)
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)] [INT64(4)]]`)
+
+	exec(t, conn, "rollback to c")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)]]`)
+
+	exec(t, conn, "insert into t1(id1, id2) values(2,2),(3,3),(4,4)")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)] [INT64(3)] [INT64(4)]]`)
+
+	exec(t, conn, "rollback to b")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+
+	exec(t, conn, "commit")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+
+	exec(t, conn, "start transaction")
+
+	exec(t, conn, "insert into t1(id1, id2) values(2,2),(3,3),(4,4)")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(2)] [INT64(3)] [INT64(4)]]`)
+
+	// After previous commit all the savepoints are cleared.
+	_, err = conn.ExecuteFetch("rollback to b", 1000, true)
+	require.Error(t, err)
+
+	exec(t, conn, "rollback")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+}
+
+func TestSavepointOutsideTx(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "savepoint a")
+	exec(t, conn, "savepoint b")
+
+	_, err = conn.ExecuteFetch("rollback to b", 1, true)
+	require.Error(t, err)
+	_, err = conn.ExecuteFetch("release savepoint a", 1, true)
+	require.Error(t, err)
+}
+
+func TestSavepointAdditionalCase(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "start transaction")
+	exec(t, conn, "savepoint a")
+	exec(t, conn, "insert into t1(id1, id2) values(1,1)")             // -80
+	exec(t, conn, "insert into t1(id1, id2) values(2,2),(3,3),(4,4)") // -80 & 80-
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)] [INT64(3)] [INT64(4)]]`)
+
+	exec(t, conn, "rollback to a")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+
+	exec(t, conn, "commit")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+
+	exec(t, conn, "start transaction")
+	exec(t, conn, "insert into t1(id1, id2) values(1,1)") // -80
+	exec(t, conn, "savepoint a")
+	exec(t, conn, "insert into t1(id1, id2) values(2,2),(3,3)") // -80
+	exec(t, conn, "insert into t1(id1, id2) values(4,4)")       // 80-
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)] [INT64(2)] [INT64(3)] [INT64(4)]]`)
+
+	exec(t, conn, "rollback to a")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[[INT64(1)]]`)
+
+	exec(t, conn, "rollback")
+	assertMatches(t, conn, "select id1 from t1 order by id1", `[]`)
+}
+
+func TestExplainPassthrough(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	result := exec(t, conn, "explain select * from t1")
+	got := fmt.Sprintf("%v", result.Rows)
+	require.Contains(t, got, "SIMPLE") // there is a lot more coming from mysql,
+	// but we are trying to make the test less fragile
+
+	result = exec(t, conn, "explain ks.t1")
+	require.EqualValues(t, 2, len(result.Rows))
+}
+
+func TestXXHash(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "insert into t7_xxhash(uid, phone, msg) values('u-1', 1, 'message')")
+	assertMatches(t, conn, "select uid, phone, msg from t7_xxhash where phone = 1", `[[VARCHAR("u-1") INT64(1) VARCHAR("message")]]`)
+	assertMatches(t, conn, "select phone, keyspace_id from t7_xxhash_idx", `[[INT64(1) VARBINARY("\x1cU^f\xbfyE^")]]`)
+	exec(t, conn, "update t7_xxhash set phone = 2 where uid = 'u-1'")
+	assertMatches(t, conn, "select uid, phone, msg from t7_xxhash where phone = 1", `[]`)
+	assertMatches(t, conn, "select uid, phone, msg from t7_xxhash where phone = 2", `[[VARCHAR("u-1") INT64(2) VARCHAR("message")]]`)
+	assertMatches(t, conn, "select phone, keyspace_id from t7_xxhash_idx", `[[INT64(2) VARBINARY("\x1cU^f\xbfyE^")]]`)
+	exec(t, conn, "delete from t7_xxhash where uid = 'u-1'")
+	assertMatches(t, conn, "select uid, phone, msg from t7_xxhash where uid = 'u-1'", `[]`)
+	assertMatches(t, conn, "select phone, keyspace_id from t7_xxhash_idx", `[]`)
+}
+
+func TestShowTablesWithWhereClause(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	assertMatches(t, conn, "show tables from ks where Tables_in_ks='t6'", `[[VARCHAR("t6")]]`)
+	exec(t, conn, "begin")
+	assertMatches(t, conn, "show tables from ks where Tables_in_ks='t3'", `[[VARCHAR("t3")]]`)
+}
+
+func TestOffsetAndLimitWithOLAP(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	defer exec(t, conn, "set workload=oltp;delete from t1")
+
+	exec(t, conn, "insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)")
+	assertMatches(t, conn, "select id1 from t1 order by id1 limit 3 offset 2", "[[INT64(3)] [INT64(4)] [INT64(5)]]")
+	exec(t, conn, "set workload='olap'")
+	assertMatches(t, conn, "select id1 from t1 order by id1 limit 3 offset 2", "[[INT64(3)] [INT64(4)] [INT64(5)]]")
+}
+
+func TestSwitchBetweenOlapAndOltp(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	assertMatches(t, conn, "select @@workload", `[[VARBINARY("OLTP")]]`)
+
+	exec(t, conn, "set workload='olap'")
+
+	assertMatches(t, conn, "select @@workload", `[[VARBINARY("OLAP")]]`)
+
+	exec(t, conn, "set workload='oltp'")
+
+	assertMatches(t, conn, "select @@workload", `[[VARBINARY("OLTP")]]`)
+}
+
+func TestFoundRowsOnDualQueries(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "select 42")
+	assertMatches(t, conn, "select found_rows()", "[[UINT64(1)]]")
+}
+
+func TestUseStmtInOLAP(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	queries := []string{"set workload='olap'", "use `ks:80-`", "use `ks:-80`"}
+	for i, q := range queries {
+		t.Run(fmt.Sprintf("%d-%s", i, q), func(t *testing.T) {
+			exec(t, conn, q)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestInsertStmtInOLAP(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	exec(t, conn, `set workload='olap'`)
+	_, err = conn.ExecuteFetch(`insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`, 1000, true)
+	require.Error(t, err)
+	assertMatches(t, conn, `select id1 from t1 order by id1`, `[]`)
+}
+
+func TestDistinct(t *testing.T) {
+	defer cluster.PanicHandler(t)
+
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+	exec(t, conn, "insert into t3(id5,id6,id7) values(1,3,3), (2,3,4), (3,3,6), (4,5,7), (5,5,6)")
+	exec(t, conn, "insert into t7_xxhash(uid,phone) values('1',4), ('2',4), ('3',3), ('4',1), ('5',1)")
+	exec(t, conn, "insert into aggr_test(id, val1, val2) values(1,'a',1), (2,'A',1), (3,'b',1), (4,'c',3), (5,'c',4)")
+	exec(t, conn, "insert into aggr_test(id, val1, val2) values(6,'d',null), (7,'e',null), (8,'E',1)")
+	assertMatches(t, conn, "select distinct val2, count(*) from aggr_test group by val2", `[[NULL INT64(2)] [INT64(1) INT64(4)] [INT64(3) INT64(1)] [INT64(4) INT64(1)]]`)
+	assertMatches(t, conn, "select distinct id6 from t3 join t7_xxhash on t3.id5 = t7_xxhash.phone", `[[INT64(3)] [INT64(5)]]`)
+	exec(t, conn, "delete from t3")
+	exec(t, conn, "delete from t7_xxhash")
+	exec(t, conn, "delete from aggr_test")
+}
+
+func TestCreateIndex(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	// Test that create index with the correct table name works
+	_, err = conn.ExecuteFetch(`create index i1 on t1 (id1)`, 1000, true)
+	require.NoError(t, err)
+	// Test routing rules for create index.
+	_, err = conn.ExecuteFetch(`create index i2 on ks.t1000 (id1)`, 1000, true)
+	require.NoError(t, err)
+}
+
+func TestCreateView(t *testing.T) {
+	// The test wont work since we cant change the vschema without reloading the vtgate.
+	t.Skip()
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	defer exec(t, conn, `delete from t1`)
+	// Test that create view works and the output is as expected
+	exec(t, conn, `create view v1 as select * from t1`)
+	exec(t, conn, `insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`)
+	// This wont work, since ALTER VSCHEMA ADD TABLE is only supported for unsharded keyspaces
+	exec(t, conn, "alter vschema add table v1")
+	assertMatches(t, conn, "select * from v1", `[[INT64(1) INT64(1)] [INT64(2) INT64(2)] [INT64(3) INT64(3)] [INT64(4) INT64(4)] [INT64(5) INT64(5)]]`)
+}
+
+func TestVersions(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	qr := exec(t, conn, `select @@version`)
+	assert.Contains(t, fmt.Sprintf("%v", qr.Rows), "vitess")
+
+	qr = exec(t, conn, `select @@version_comment`)
+	assert.Contains(t, fmt.Sprintf("%v", qr.Rows), "Git revision")
+}
+
+func TestFlush(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	exec(t, conn, "flush local tables t1, t2")
+}
+
+func TestShowVariables(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	res := exec(t, conn, "show variables like \"%version%\";")
+	found := false
+	for _, row := range res.Rows {
+		if row[0].ToString() == "version" {
+			assert.Contains(t, row[1].ToString(), "vitess")
+			found = true
+		}
+	}
+	require.True(t, found, "Expected a row for version in show query")
+}
+
+func TestOrderBy(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+	exec(t, conn, "insert into t4(id1, id2) values(1,'a'), (2,'Abc'), (3,'b'), (4,'c'), (5,'test')")
+	exec(t, conn, "insert into t4(id1, id2) values(6,'d'), (7,'e'), (8,'F')")
+	// test ordering of varchar column
+	assertMatches(t, conn, "select id1, id2 from t4 order by id2 desc", `[[INT64(5) VARCHAR("test")] [INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+	// test ordering of int column
+	assertMatches(t, conn, "select id1, id2 from t4 order by id1 desc", `[[INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(5) VARCHAR("test")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+
+	defer func() {
+		exec(t, conn, "set workload = oltp")
+		exec(t, conn, "delete from t4")
+	}()
+	// Test the same queries in streaming mode
+	exec(t, conn, "set workload = olap")
+	assertMatches(t, conn, "select id1, id2 from t4 order by id2 desc", `[[INT64(5) VARCHAR("test")] [INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+	assertMatches(t, conn, "select id1, id2 from t4 order by id1 desc", `[[INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(5) VARCHAR("test")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+}
+
+func TestSubQueryOnTopOfSubQuery(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	defer exec(t, conn, `delete from t1`)
+
+	exec(t, conn, `insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`)
+	exec(t, conn, `insert into t2(id3, id4) values (1, 3), (2, 4)`)
+
+	assertMatches(t, conn, "select id1 from t1 where id1 not in (select id3 from t2) and id2 in (select id4 from t2) order by id1", `[[INT64(3)] [INT64(4)]]`)
 }
 
 func assertMatches(t *testing.T, conn *mysql.Conn, query, expected string) {
@@ -581,16 +604,22 @@ func assertMatches(t *testing.T, conn *mysql.Conn, query, expected string) {
 		t.Errorf("Query: %s (-want +got):\n%s", query, diff)
 	}
 }
+func assertMatchesNoOrder(t *testing.T, conn *mysql.Conn, query, expected string) {
+	t.Helper()
+	qr := exec(t, conn, query)
+	actual := fmt.Sprintf("%v", qr.Rows)
+	assert.Equal(t, utils.SortString(expected), utils.SortString(actual), "for query: [%s] expected \n%s \nbut actual \n%s", query, expected, actual)
+}
 
 func assertIsEmpty(t *testing.T, conn *mysql.Conn, query string) {
 	t.Helper()
 	qr := exec(t, conn, query)
-	assert.Empty(t, qr.Rows)
+	assert.Empty(t, qr.Rows, "for query: "+query)
 }
 
 func exec(t *testing.T, conn *mysql.Conn, query string) *sqltypes.Result {
 	t.Helper()
 	qr, err := conn.ExecuteFetch(query, 1000, true)
-	require.NoError(t, err)
+	require.NoError(t, err, "for query: "+query)
 	return qr
 }

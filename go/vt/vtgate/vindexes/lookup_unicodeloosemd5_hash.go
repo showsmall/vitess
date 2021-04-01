@@ -111,11 +111,19 @@ func (lh *LookupUnicodeLooseMD5Hash) Map(vcursor VCursor, ids []sqltypes.Value) 
 		return out, nil
 	}
 
+	// if ignore_nulls is set and the query is about single null value, then fallback to all shards
+	if len(ids) == 1 && ids[0].IsNull() && lh.lkp.IgnoreNulls {
+		for range ids {
+			out = append(out, key.DestinationKeyRange{KeyRange: &topodatapb.KeyRange{}})
+		}
+		return out, nil
+	}
+
 	ids, err := convertIds(ids)
 	if err != nil {
 		return nil, err
 	}
-	results, err := lh.lkp.Lookup(vcursor, ids)
+	results, err := lh.lkp.Lookup(vcursor, ids, vtgatepb.CommitOrder_NORMAL)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +290,7 @@ func (lhu *LookupUnicodeLooseMD5HashUnique) Map(vcursor VCursor, ids []sqltypes.
 	if err != nil {
 		return nil, err
 	}
-	results, err := lhu.lkp.Lookup(vcursor, ids)
+	results, err := lhu.lkp.Lookup(vcursor, ids, vtgatepb.CommitOrder_NORMAL)
 	if err != nil {
 		return nil, err
 	}
@@ -374,7 +382,7 @@ func (lhu *LookupUnicodeLooseMD5HashUnique) MarshalJSON() ([]byte, error) {
 }
 
 func unicodeHashValue(value sqltypes.Value) (sqltypes.Value, error) {
-	hash, err := unicodeHash(value)
+	hash, err := unicodeHash(vMD5Hash, value)
 	if err != nil {
 		return sqltypes.NULL, err
 	}

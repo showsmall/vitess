@@ -47,9 +47,6 @@ func (s *SingleRow) GetTableName() string {
 // Execute performs a non-streaming exec.
 func (s *SingleRow) Execute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	result := sqltypes.Result{
-		Fields:       nil,
-		RowsAffected: 0,
-		InsertID:     0,
 		Rows: [][]sqltypes.Value{
 			{},
 		},
@@ -60,9 +57,6 @@ func (s *SingleRow) Execute(vcursor VCursor, bindVars map[string]*query.BindVari
 // StreamExecute performs a streaming exec.
 func (s *SingleRow) StreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantields bool, callback func(*sqltypes.Result) error) error {
 	result := sqltypes.Result{
-		Fields:       nil,
-		RowsAffected: 0,
-		InsertID:     0,
 		Rows: [][]sqltypes.Value{
 			{},
 		},

@@ -25,13 +25,15 @@ import (
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+
 	"vitess.io/vitess/go/trace"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/grpccommon"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/vttls"
@@ -54,13 +56,16 @@ var (
 	GRPCPort = flag.Int("grpc_port", 0, "Port to listen on for gRPC calls")
 
 	// GRPCCert is the cert to use if TLS is enabled
-	GRPCCert = flag.String("grpc_cert", "", "certificate to use, requires grpc_key, enables TLS")
+	GRPCCert = flag.String("grpc_cert", "", "server certificate to use for gRPC connections, requires grpc_key, enables TLS")
 
 	// GRPCKey is the key to use if TLS is enabled
-	GRPCKey = flag.String("grpc_key", "", "key to use, requires grpc_cert, enables TLS")
+	GRPCKey = flag.String("grpc_key", "", "server private key to use for gRPC connections, requires grpc_cert, enables TLS")
 
 	// GRPCCA is the CA to use if TLS is enabled
-	GRPCCA = flag.String("grpc_ca", "", "ca to use, requires TLS, and enforces client cert check")
+	GRPCCA = flag.String("grpc_ca", "", "server CA to use for gRPC connections, requires TLS, and enforces client certificate check")
+
+	// GRPCServerCA if specified will combine server cert and server CA
+	GRPCServerCA = flag.String("grpc_server_ca", "", "path to server CA in PEM format, which will be combine with server cert, return full certificate chain to clients")
 
 	// GRPCAuth which auth plugin to use (at the moment now only static is supported)
 	GRPCAuth = flag.String("grpc_auth_mode", "", "Which auth plugin implementation to use (eg: static)")
@@ -86,7 +91,7 @@ var (
 
 	// EnforcementPolicy MinTime that sets the keepalive enforcement policy on the server.
 	// This is the minimum amount of time a client should wait before sending a keepalive ping.
-	GRPCKeepAliveEnforcementPolicyMinTime = flag.Duration("grpc_server_keepalive_enforcement_policy_min_time", 5*time.Minute, "gRPC server minimum keepalive time")
+	GRPCKeepAliveEnforcementPolicyMinTime = flag.Duration("grpc_server_keepalive_enforcement_policy_min_time", 10*time.Second, "gRPC server minimum keepalive time")
 
 	// EnforcementPolicy PermitWithoutStream - If true, server allows keepalive pings
 	// even when there are no active streams (RPCs). If false, and client sends ping when
@@ -123,7 +128,7 @@ func createGRPCServer() {
 
 	var opts []grpc.ServerOption
 	if GRPCPort != nil && *GRPCCert != "" && *GRPCKey != "" {
-		config, err := vttls.ServerConfig(*GRPCCert, *GRPCKey, *GRPCCA)
+		config, err := vttls.ServerConfig(*GRPCCert, *GRPCKey, *GRPCCA, *GRPCServerCA)
 		if err != nil {
 			log.Exitf("Failed to log gRPC cert/key/ca: %v", err)
 		}

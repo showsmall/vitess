@@ -35,6 +35,7 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
 	"github.com/golang/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -107,8 +108,9 @@ func (thc *tabletHealthCheck) setServingState(serving bool, reason string) {
 	if !thc.loggedServingState || (serving != thc.Serving) {
 		// Emit the log from a separate goroutine to avoid holding
 		// the th lock while logging is happening
-		go log.Infof("HealthCheckUpdate(Serving State): tablet: %v serving => %v for %v/%v (%v) reason: %s",
+		log.Infof("HealthCheckUpdate(Serving State): tablet: %v serving %v => %v for %v/%v (%v) reason: %s",
 			topotools.TabletIdent(thc.Tablet),
+			thc.Serving,
 			serving,
 			thc.Tablet.GetKeyspace(),
 			thc.Tablet.GetShard(),
@@ -182,12 +184,10 @@ func (thc *tabletHealthCheck) processResponse(hc *HealthCheckImpl, shr *query.St
 		return vterrors.New(vtrpc.Code_FAILED_PRECONDITION, fmt.Sprintf("health stats mismatch, tablet %+v alias does not match response alias %v", thc.Tablet, shr.TabletAlias))
 	}
 
-	currentTarget := thc.Target
+	prevTarget := thc.Target
 	// check whether this is a trivial update so as to update healthy map
-	trivialNonMasterUpdate := thc.LastError == nil && thc.Serving && shr.RealtimeStats.HealthError == "" && shr.Serving &&
-		currentTarget.TabletType != topodata.TabletType_MASTER && currentTarget.TabletType == shr.Target.TabletType && thc.isTrivialReplagChange(shr.RealtimeStats)
-	isMasterUpdate := shr.Target.TabletType == topodata.TabletType_MASTER
-	isMasterChange := thc.Target.TabletType != topodata.TabletType_MASTER && shr.Target.TabletType == topodata.TabletType_MASTER
+	trivialUpdate := thc.LastError == nil && thc.Serving && shr.RealtimeStats.HealthError == "" && shr.Serving &&
+		prevTarget.TabletType != topodata.TabletType_MASTER && prevTarget.TabletType == shr.Target.TabletType && thc.isTrivialReplagChange(shr.RealtimeStats)
 	thc.lastResponseTimestamp = time.Now()
 	thc.Target = shr.Target
 	thc.MasterTermStartTime = shr.TabletExternallyReparentedTimestamp
@@ -200,7 +200,7 @@ func (thc *tabletHealthCheck) processResponse(hc *HealthCheckImpl, shr *query.St
 	thc.setServingState(serving, reason)
 
 	// notify downstream for master change
-	hc.updateHealth(thc.SimpleCopy(), shr, currentTarget, trivialNonMasterUpdate, isMasterUpdate, isMasterChange)
+	hc.updateHealth(thc.SimpleCopy(), prevTarget, trivialUpdate, true)
 	return nil
 }
 
@@ -238,6 +238,9 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		thc.finalizeConn()
 		hc.connsWG.Done()
 	}()
+
+	// Initialize error counter
+	hcErrorCounters.Add([]string{thc.Target.Keyspace, thc.Target.Shard, topoproto.TabletTypeLString(thc.Target.TabletType)}, 0)
 
 	retryDelay := hc.retryDelay
 	for {
@@ -285,12 +288,14 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		streamCancel()
 
 		if err != nil {
+			hcErrorCounters.Add([]string{thc.Target.Keyspace, thc.Target.Shard, topoproto.TabletTypeLString(thc.Target.TabletType)}, 1)
 			if strings.Contains(err.Error(), "health stats mismatch") {
 				hc.deleteTablet(thc.Tablet)
 				return
 			}
-			res := thc.SimpleCopy()
-			hc.broadcast(res)
+			// trivialUpdate = false because this is an error
+			// isPrimaryUp = false because we did not get a healthy response
+			hc.updateHealth(thc.SimpleCopy(), thc.Target, false, false)
 		}
 		// If there was a timeout send an error. We do this after stream has returned.
 		// This will ensure that this update prevails over any previous message that
@@ -299,7 +304,9 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 			thc.LastError = fmt.Errorf("healthcheck timed out (latest %v)", thc.lastResponseTimestamp)
 			thc.setServingState(false, thc.LastError.Error())
 			hcErrorCounters.Add([]string{thc.Target.Keyspace, thc.Target.Shard, topoproto.TabletTypeLString(thc.Target.TabletType)}, 1)
-			hc.broadcast(thc.SimpleCopy())
+			// trivialUpdate = false because this is an error
+			// isPrimaryUp = false because we did not get a healthy response within the timeout
+			hc.updateHealth(thc.SimpleCopy(), thc.Target, false, false)
 		}
 
 		// Streaming RPC failed e.g. because vttablet was restarted or took too long.

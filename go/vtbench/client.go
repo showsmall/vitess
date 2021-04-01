@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -160,5 +161,5 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 }
 
 func (c *grpcVttabletConn) execute(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return c.qs.Execute(ctx, &c.target, query, bindVars, 0, nil)
+	return c.qs.Execute(ctx, &c.target, query, bindVars, 0, 0, nil)
 }

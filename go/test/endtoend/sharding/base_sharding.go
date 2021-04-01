@@ -52,7 +52,7 @@ var (
 )
 
 const (
-	MaxRowsToFetch = 10000
+	maxRowsToFetch = 10000
 )
 
 // CheckSrvKeyspace verifies the schema with expectedPartition
@@ -104,7 +104,7 @@ func CheckValues(t *testing.T, vttablet cluster.Vttablet, id uint64, msg string,
 	}
 	var result *sqltypes.Result
 	if dbConn != nil {
-		r1, err := dbConn.ExecuteFetch(query, MaxRowsToFetch, true)
+		r1, err := dbConn.ExecuteFetch(query, maxRowsToFetch, true)
 		require.Nil(t, err)
 		result = r1
 	} else {
@@ -246,10 +246,10 @@ func InsertLots(t *testing.T, count uint64, vttablet cluster.Vttablet, table str
 }
 
 func executeQueryInTransaction(t *testing.T, query string, dbConn *mysql.Conn) {
-	dbConn.ExecuteFetch("begin", MaxRowsToFetch, true)
-	_, err := dbConn.ExecuteFetch(query, MaxRowsToFetch, true)
+	dbConn.ExecuteFetch("begin", maxRowsToFetch, true)
+	_, err := dbConn.ExecuteFetch(query, maxRowsToFetch, true)
 	require.NoError(t, err)
-	dbConn.ExecuteFetch("commit", MaxRowsToFetch, true)
+	dbConn.ExecuteFetch("commit", maxRowsToFetch, true)
 }
 
 // ExecuteOnTablet executes a write query on specified vttablet
@@ -328,14 +328,6 @@ func checkLots(t *testing.T, vttablet cluster.Vttablet, count uint64, table stri
 	return float64(float64(totalFound) * 100 / float64(count) / 2)
 }
 
-// CheckRunningBinlogPlayer Checks binlog player is running and showing in status
-func CheckRunningBinlogPlayer(t *testing.T, vttablet cluster.Vttablet, numberOfQueries int, numberOfTxns int) {
-	status := vttablet.VttabletProcess.GetStatus()
-	assert.Contains(t, status, "VReplication state: Open")
-	assert.Contains(t, status, fmt.Sprintf("<td><b>All</b>: %d<br><b>Query</b>: %d<br><b>Transaction</b>: %d<br></td>", numberOfQueries+numberOfTxns, numberOfQueries, numberOfTxns))
-	assert.Contains(t, status, "</html>")
-}
-
 // CheckTabletQueryServices check that the query service is enabled or disabled on the specified tablets.
 func CheckTabletQueryServices(t *testing.T, vttablets []cluster.Vttablet, expectedStatus string, tabletControlEnabled bool, ci cluster.LocalProcessCluster) {
 	for _, tablet := range vttablets {
@@ -348,7 +340,7 @@ func CheckTabletQueryService(t *testing.T, vttablet cluster.Vttablet, expectedSt
 	tabletStatus := vttablet.VttabletProcess.GetTabletStatus()
 	assert.Equal(t, tabletStatus, expectedStatus)
 
-	queryServiceDisabled := "Query Service disabled: TabletControl.DisableQueryService set"
+	queryServiceDisabled := "TabletControl.DisableQueryService set"
 	status := vttablet.VttabletProcess.GetStatus()
 	if tabletControlEnabled {
 		assert.Contains(t, status, queryServiceDisabled)

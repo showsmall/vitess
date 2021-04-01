@@ -54,11 +54,11 @@ func TestUpdateUnsharded(t *testing.T) {
 	// Failure cases
 	vc = &loggingVCursor{shardErr: errors.New("shard_error")}
 	_, err = upd.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execUpdateUnsharded: shard_error")
+	require.EqualError(t, err, `shard_error`)
 
 	vc = &loggingVCursor{}
 	_, err = upd.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "Keyspace does not have exactly one shard: []")
+	require.EqualError(t, err, `Keyspace does not have exactly one shard: []`)
 }
 
 func TestUpdateEqual(t *testing.T) {
@@ -87,7 +87,7 @@ func TestUpdateEqual(t *testing.T) {
 	// Failure case
 	upd.Values = []sqltypes.PlanValue{{Key: "aa"}}
 	_, err = upd.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execUpdateEqual: missing bind var aa")
+	require.EqualError(t, err, `missing bind var aa`)
 }
 
 func TestUpdateScatter(t *testing.T) {
@@ -163,7 +163,7 @@ func TestUpdateEqualNoRoute(t *testing.T) {
 	require.NoError(t, err)
 	vc.ExpectLog(t, []string{
 		// This lookup query will return no rows. So, the DML will not be sent anywhere.
-		`Execute select toc from lkp where from = :from from: type:INT64 value:"1"  false`,
+		`Execute select from, toc from lkp where from in ::from from: type:TUPLE values:<type:INT64 value:"1" >  false`,
 	})
 }
 
@@ -189,7 +189,7 @@ func TestUpdateEqualNoScatter(t *testing.T) {
 
 	vc := newDMLTestVCursor("0")
 	_, err := upd.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execUpdateEqual: cannot map vindex to unique keyspace id: DestinationKeyRange(-)")
+	require.EqualError(t, err, `cannot map vindex to unique keyspace id: DestinationKeyRange(-)`)
 }
 
 func TestUpdateEqualChangedVindex(t *testing.T) {
@@ -205,23 +205,29 @@ func TestUpdateEqualChangedVindex(t *testing.T) {
 			OwnedVindexQuery: "dummy_subquery",
 			KsidVindex:       ks.Vindexes["hash"].(vindexes.SingleColumn),
 		},
-		ChangedVindexValues: map[string]VindexValues{
+		ChangedVindexValues: map[string]*VindexValues{
 			"twocol": {
-				"c1": {Value: sqltypes.NewInt64(1)},
-				"c2": {Value: sqltypes.NewInt64(2)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c1": {Value: sqltypes.NewInt64(1)},
+					"c2": {Value: sqltypes.NewInt64(2)},
+				},
+				Offset: 4,
 			},
 			"onecol": {
-				"c3": {Value: sqltypes.NewInt64(3)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c3": {Value: sqltypes.NewInt64(3)},
+				},
+				Offset: 5,
 			},
 		},
 	}
 
 	results := []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
+		"1|4|5|6|0|0",
 	)}
 	vc := newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -258,14 +264,14 @@ func TestUpdateEqualChangedVindex(t *testing.T) {
 		`ExecuteMultiShard sharded.-20: dummy_update {} true true`,
 	})
 
-	// Failure case: multiple rows changing.
+	// multiple rows changing.
 	results = []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
-		"1|7|8|9",
+		"1|4|5|6|0|0",
+		"1|7|8|9|0|0",
 	)}
 	vc = newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -284,8 +290,40 @@ func TestUpdateEqualChangedVindex(t *testing.T) {
 		// 6 has to be replaced by 3.
 		`Execute delete from lkp1 where from = :from and toc = :toc from: type:INT64 value:"6" toc: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
 		`Execute insert into lkp1(from, toc) values(:from_0, :toc_0) from_0: type:INT64 value:"3" toc_0: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		// 7,8 have to be replaced by 1,2 (the new values).
 		`Execute delete from lkp2 where from1 = :from1 and from2 = :from2 and toc = :toc from1: type:INT64 value:"7" from2: type:INT64 value:"8" toc: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
 		`Execute insert into lkp2(from1, from2, toc) values(:from1_0, :from2_0, :toc_0) from1_0: type:INT64 value:"1" from2_0: type:INT64 value:"2" toc_0: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		// 9 has to be replaced by 3.
+		`Execute delete from lkp1 where from = :from and toc = :toc from: type:INT64 value:"9" toc: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		`Execute insert into lkp1(from, toc) values(:from_0, :toc_0) from_0: type:INT64 value:"3" toc_0: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		// Finally, the actual update, which is also sent to -20, same route as the subquery.
+		`ExecuteMultiShard sharded.-20: dummy_update {} true true`,
+	})
+
+	// multiple rows changing, but only some vindex actually changes
+	results = []*sqltypes.Result{sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields(
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
+		),
+		"1|4|5|6|0|1", // twocol changes
+		"1|7|8|9|1|0", // onecol changes
+	)}
+	vc = newDMLTestVCursor("-20", "20-")
+	vc.results = results
+
+	_, err = upd.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	require.NoError(t, err)
+	vc.ExpectLog(t, []string{
+		`ResolveDestinations sharded [] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
+		// ResolveDestinations is hard-coded to return -20.
+		// It gets used to perform the subquery to fetch the changing column values.
+		`ExecuteMultiShard sharded.-20: dummy_subquery {} false false`,
+		// Those values are returned as 4,5 for twocol and 6 for onecol.
+		// 4,5 have to be replaced by 1,2 (the new values).
+		`Execute delete from lkp2 where from1 = :from1 and from2 = :from2 and toc = :toc from1: type:INT64 value:"4" from2: type:INT64 value:"5" toc: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		`Execute insert into lkp2(from1, from2, toc) values(:from1_0, :from2_0, :toc_0) from1_0: type:INT64 value:"1" from2_0: type:INT64 value:"2" toc_0: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
+		// 9 has to be replaced by 3.
 		`Execute delete from lkp1 where from = :from and toc = :toc from: type:INT64 value:"9" toc: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
 		`Execute insert into lkp1(from, toc) values(:from_0, :toc_0) from_0: type:INT64 value:"3" toc_0: type:VARBINARY value:"\026k@\264J\272K\326"  true`,
 		// Finally, the actual update, which is also sent to -20, same route as the subquery.
@@ -306,23 +344,29 @@ func TestUpdateScatterChangedVindex(t *testing.T) {
 			OwnedVindexQuery: "dummy_subquery",
 			KsidVindex:       ks.Vindexes["hash"].(vindexes.SingleColumn),
 		},
-		ChangedVindexValues: map[string]VindexValues{
+		ChangedVindexValues: map[string]*VindexValues{
 			"twocol": {
-				"c1": {Value: sqltypes.NewInt64(1)},
-				"c2": {Value: sqltypes.NewInt64(2)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c1": {Value: sqltypes.NewInt64(1)},
+					"c2": {Value: sqltypes.NewInt64(2)},
+				},
+				Offset: 4,
 			},
 			"onecol": {
-				"c3": {Value: sqltypes.NewInt64(3)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c3": {Value: sqltypes.NewInt64(3)},
+				},
+				Offset: 5,
 			},
 		},
 	}
 
 	results := []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
+		"1|4|5|6|0|0",
 	)}
 	vc := newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -362,11 +406,11 @@ func TestUpdateScatterChangedVindex(t *testing.T) {
 	// Update can affect multiple rows
 	results = []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
-		"1|7|8|9",
+		"1|4|5|6|0|0",
+		"1|7|8|9|0|0",
 	)}
 	vc = newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -441,24 +485,30 @@ func TestUpdateInChangedVindex(t *testing.T) {
 			OwnedVindexQuery: "dummy_subquery",
 			KsidVindex:       ks.Vindexes["hash"].(vindexes.SingleColumn),
 		},
-		ChangedVindexValues: map[string]VindexValues{
+		ChangedVindexValues: map[string]*VindexValues{
 			"twocol": {
-				"c1": {Value: sqltypes.NewInt64(1)},
-				"c2": {Value: sqltypes.NewInt64(2)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c1": {Value: sqltypes.NewInt64(1)},
+					"c2": {Value: sqltypes.NewInt64(2)},
+				},
+				Offset: 4,
 			},
 			"onecol": {
-				"c3": {Value: sqltypes.NewInt64(3)},
+				PvMap: map[string]sqltypes.PlanValue{
+					"c3": {Value: sqltypes.NewInt64(3)},
+				},
+				Offset: 5,
 			},
 		},
 	}
 
 	results := []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
-		"2|21|22|23",
+		"1|4|5|6|0|0",
+		"2|21|22|23|0|0",
 	)}
 	vc := newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -501,15 +551,15 @@ func TestUpdateInChangedVindex(t *testing.T) {
 		`ExecuteMultiShard sharded.-20: dummy_update {} true true`,
 	})
 
-	// Failure case: multiple rows changing.
+	// multiple rows changing.
 	results = []*sqltypes.Result{sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
-			"id|c1|c2|c3",
-			"int64|int64|int64|int64",
+			"id|c1|c2|c3|twocol|onecol",
+			"int64|int64|int64|int64|int64|int64",
 		),
-		"1|4|5|6",
-		"1|7|8|9",
-		"2|21|22|23",
+		"1|4|5|6|0|0",
+		"1|7|8|9|0|0",
+		"2|21|22|23|0|0",
 	)}
 	vc = newDMLTestVCursor("-20", "20-")
 	vc.results = results
@@ -548,7 +598,7 @@ func TestUpdateInChangedVindex(t *testing.T) {
 func TestUpdateNoStream(t *testing.T) {
 	upd := &Update{}
 	err := upd.StreamExecute(nil, nil, false, nil)
-	expectError(t, "StreamExecute", err, `query "" cannot be used for streaming`)
+	require.EqualError(t, err, `query "" cannot be used for streaming`)
 }
 
 func buildTestVSchema() *vindexes.VSchema {

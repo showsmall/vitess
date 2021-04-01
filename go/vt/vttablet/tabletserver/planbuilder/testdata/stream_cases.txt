@@ -37,12 +37,20 @@
   "FullQuery": "show tables"
 }
 
+# show table status
+"show table status"
+{
+  "PlanID": "SelectStream",
+  "TableName": "",
+  "FullQuery": "show table status"
+}
+
 # other
 "desc foo"
 {
   "PlanID": "SelectStream",
   "TableName": "",
-  "FullQuery": "otherread"
+  "FullQuery": "explain foo"
 }
 
 # dml
@@ -55,4 +63,4 @@
 
 # named locks are unsafe with server-side connection pooling
 "select get_lock('foo') from dual"
-"get_lock() not allowed"
+"get_lock('foo') not allowed without a reserved connections"

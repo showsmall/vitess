@@ -32,9 +32,10 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/golang/protobuf/proto"
+
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -128,27 +129,6 @@ func NewTransactionalQueryResultReaderForTablet(ctx context.Context, ts *topo.Se
 		fields: cols.Fields,
 		conn:   conn,
 	}, nil
-}
-
-// RollbackTransaction rolls back the transaction
-func RollbackTransaction(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, txID int64) error {
-	shortCtx, cancel := context.WithTimeout(ctx, *remoteActionsTimeout)
-	tablet, err := ts.GetTablet(shortCtx, tabletAlias)
-	cancel()
-	if err != nil {
-		return err
-	}
-
-	conn, err := tabletconn.GetDialer()(tablet.Tablet, grpcclient.FailFast(false))
-	if err != nil {
-		return err
-	}
-
-	return conn.Rollback(ctx, &querypb.Target{
-		Keyspace:   tablet.Tablet.Keyspace,
-		Shard:      tablet.Tablet.Shard,
-		TabletType: tablet.Tablet.Type,
-	}, txID)
 }
 
 // Next returns the next result on the stream. It implements ResultReader.
@@ -580,22 +560,22 @@ func (rd *RowDiffer) Go(log logutil.Logger) (dr DiffReport, err error) {
 
 			// drain right, update count
 			log.Errorf("Draining extra row(s) found on the right starting with: %v", right)
-			if count, err := rd.right.Drain(); err != nil {
+			var count int
+			if count, err = rd.right.Drain(); err != nil {
 				return dr, err
-			} else {
-				dr.extraRowsRight += 1 + count
 			}
+			dr.extraRowsRight += 1 + count
 			return
 		}
 		if right == nil {
 			// no more rows from the right
 			// we know we have rows from left, drain, update count
 			log.Errorf("Draining extra row(s) found on the left starting with: %v", left)
-			if count, err := rd.left.Drain(); err != nil {
+			var count int
+			if count, err = rd.left.Drain(); err != nil {
 				return dr, err
-			} else {
-				dr.extraRowsLeft += 1 + count
 			}
+			dr.extraRowsLeft += 1 + count
 			return
 		}
 
@@ -675,7 +655,8 @@ func createTransactions(ctx context.Context, numberOfScanners int, wr *wrangler.
 			if err != nil {
 				return err
 			}
-			return queryService.Rollback(ctx, target, tx)
+			_, err = queryService.Rollback(ctx, target, tx)
+			return err
 		})
 
 		scanners[i] = tx

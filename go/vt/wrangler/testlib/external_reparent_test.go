@@ -21,8 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/vt/discovery"
+
+	"context"
+
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -38,6 +42,12 @@ import (
 
 // TestTabletExternallyReparentedBasic tests the base cases for TER
 func TestTabletExternallyReparentedBasic(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
@@ -49,18 +59,18 @@ func TestTabletExternallyReparentedBasic(t *testing.T) {
 	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, nil)
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	if err != nil {
 		t.Fatalf("RebuildKeyspaceLocked failed: %v", err)
 	}
 
 	// On the elected master, we will respond to
-	// TabletActionSlaveWasPromoted
+	// TabletActionReplicaWasPromoted
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only respond to
-	// TabletActionSlaveWasRestarted.
+	// TabletActionReplicaWasRestarted.
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
@@ -82,7 +92,7 @@ func TestTabletExternallyReparentedBasic(t *testing.T) {
 	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
-		"START SLAVE",
+		"START Replica",
 	}
 
 	// This tests the good case, where everything works as planned
@@ -123,7 +133,13 @@ func TestTabletExternallyReparentedBasic(t *testing.T) {
 	}
 }
 
-func TestTabletExternallyReparentedToSlave(t *testing.T) {
+func TestTabletExternallyReparentedToReplica(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
@@ -135,18 +151,18 @@ func TestTabletExternallyReparentedToSlave(t *testing.T) {
 	newMaster.FakeMysqlDaemon.Replicating = true
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	if err != nil {
 		t.Fatalf("RebuildKeyspaceLocked failed: %v", err)
 	}
 
 	// On the elected master, we will respond to
-	// TabletActionSlaveWasPromoted
+	// TabletActionReplicaWasPromoted
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only respond to
-	// TabletActionSlaveWasRestarted.
+	// TabletActionReplicaWasRestarted.
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
@@ -155,10 +171,10 @@ func TestTabletExternallyReparentedToSlave(t *testing.T) {
 	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
-		"START SLAVE",
+		"START Replica",
 	}
 
-	// This tests a bad case: the new designated master is a slave at mysql level,
+	// This tests a bad case: the new designated master is a replica at mysql level,
 	// but we should do what we're told anyway.
 	if err := wr.TabletExternallyReparented(ctx, newMaster.Tablet.Alias); err != nil {
 		t.Fatalf("TabletExternallyReparented(replica) error: %v", err)
@@ -200,6 +216,12 @@ func TestTabletExternallyReparentedToSlave(t *testing.T) {
 // that if mysql is restarted on the master-elect tablet and has a different
 // port, we pick it up correctly.
 func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
@@ -210,7 +232,7 @@ func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
 	goodReplica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	if err != nil {
 		t.Fatalf("RebuildKeyspaceLocked failed: %v", err)
 	}
@@ -218,7 +240,7 @@ func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
 	// but without updating the Tablet record in topology.
 
 	// On the elected master, we will respond to
-	// TabletActionSlaveWasPromoted, so we need a MysqlDaemon
+	// TabletActionReplicaWasPromoted, so we need a MysqlDaemon
 	// that returns no master, and the new port (as returned by mysql)
 	newMaster.FakeMysqlDaemon.MysqlPort.Set(3303)
 	newMaster.StartActionLoop(t, wr)
@@ -227,15 +249,15 @@ func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
 	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
-		"START SLAVE",
+		"START Replica",
 	}
 	// On the old master, we will only respond to
-	// TabletActionSlaveWasRestarted and point to the new mysql port
+	// TabletActionReplicaWasRestarted and point to the new mysql port
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	// On the good replicas, we will respond to
-	// TabletActionSlaveWasRestarted and point to the new mysql port
+	// TabletActionReplicaWasRestarted and point to the new mysql port
 	goodReplica.StartActionLoop(t, wr)
 	defer goodReplica.StopActionLoop(t)
 
@@ -279,6 +301,12 @@ func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
 // TestTabletExternallyReparentedContinueOnUnexpectedMaster makes sure
 // that we ignore mysql's master if the flag is set
 func TestTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
@@ -289,12 +317,12 @@ func TestTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T) {
 	goodReplica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	if err != nil {
 		t.Fatalf("RebuildKeyspaceLocked failed: %v", err)
 	}
 	// On the elected master, we will respond to
-	// TabletActionSlaveWasPromoted, so we need a MysqlDaemon
+	// TabletActionReplicaWasPromoted, so we need a MysqlDaemon
 	// that returns no master, and the new port (as returned by mysql)
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
@@ -302,15 +330,15 @@ func TestTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T) {
 	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
-		"START SLAVE",
+		"START Replica",
 	}
 	// On the old master, we will only respond to
-	// TabletActionSlaveWasRestarted and point to a bad host
+	// TabletActionReplicaWasRestarted and point to a bad host
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	// On the good replica, we will respond to
-	// TabletActionSlaveWasRestarted and point to a bad host
+	// TabletActionReplicaWasRestarted and point to a bad host
 	goodReplica.StartActionLoop(t, wr)
 	defer goodReplica.StopActionLoop(t)
 
@@ -351,6 +379,12 @@ func TestTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T) {
 }
 
 func TestTabletExternallyReparentedRerun(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
@@ -361,28 +395,28 @@ func TestTabletExternallyReparentedRerun(t *testing.T) {
 	goodReplica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	if err != nil {
 		t.Fatalf("RebuildKeyspaceLocked failed: %v", err)
 	}
 	// On the elected master, we will respond to
-	// TabletActionSlaveWasPromoted.
+	// TabletActionReplicaWasPromoted.
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
-		"START SLAVE",
+		"START Replica",
 	}
 	// On the old master, we will only respond to
-	// TabletActionSlaveWasRestarted.
+	// TabletActionReplicaWasRestarted.
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	goodReplica.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
 	// On the good replica, we will respond to
-	// TabletActionSlaveWasRestarted.
+	// TabletActionReplicaWasRestarted.
 	goodReplica.StartActionLoop(t, wr)
 	defer goodReplica.StopActionLoop(t)
 
@@ -439,6 +473,12 @@ func TestTabletExternallyReparentedRerun(t *testing.T) {
 }
 
 func TestRPCTabletExternallyReparentedDemotesMasterToConfiguredTabletType(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	flag.Set("disable_active_reparents", "true")
 	defer flag.Set("disable_active_reparents", "false")
 
@@ -456,7 +496,7 @@ func TestRPCTabletExternallyReparentedDemotesMasterToConfiguredTabletType(t *tes
 	defer newMaster.StopActionLoop(t)
 
 	// Build keyspace graph
-	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"})
+	err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, oldMaster.Tablet.Keyspace, []string{"cell1"}, false)
 	assert.NoError(t, err, "RebuildKeyspaceLocked failed: %v", err)
 
 	// Reparent to new master

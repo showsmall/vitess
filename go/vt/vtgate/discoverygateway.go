@@ -24,8 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
-	"vitess.io/vitess/go/vt/topotools"
+	"context"
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/discovery"
@@ -39,7 +38,6 @@ import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/topo/topoproto"
 )
 
 const (
@@ -120,7 +118,7 @@ func NewDiscoveryGateway(ctx context.Context, hc discovery.LegacyHealthCheck, se
 	// We set sendDownEvents=true because it's required by LegacyTabletStatsCache.
 	hc.SetListener(dg, true /* sendDownEvents */)
 
-	cells := *discovery.CellsToWatch
+	cells := *CellsToWatch
 	log.Infof("loading tablets for cells: %v", cells)
 	for _, c := range strings.Split(cells, ",") {
 		if c == "" {
@@ -209,7 +207,8 @@ func (dg *DiscoveryGateway) WaitForTablets(ctx context.Context, tabletTypesToWai
 		return err
 	}
 
-	return dg.tsc.WaitForAllServingTablets(ctx, targets)
+	filteredTargets := discovery.FilterTargetsByKeyspaces(discovery.KeyspacesToWatch, targets)
+	return dg.tsc.WaitForAllServingTablets(ctx, filteredTargets)
 }
 
 // Close shuts down underlying connections.
@@ -241,7 +240,6 @@ func (dg *DiscoveryGateway) CacheStatus() TabletCacheStatusList {
 // a resharding event, and set the re-resolve bit and let the upper layers
 // re-resolve and retry.
 func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Target, unused queryservice.QueryService, name string, inTransaction bool, inner func(ctx context.Context, target *querypb.Target, conn queryservice.QueryService) (bool, error)) error {
-	var tabletLastUsed *topodatapb.Tablet
 	var err error
 	invalidTablets := make(map[string]bool)
 
@@ -289,7 +287,7 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		tablets := dg.tsc.GetHealthyTabletStats(target.Keyspace, target.Shard, target.TabletType)
 		if len(tablets) == 0 {
 			// fail fast if there is no tablet
-			err = vterrors.New(vtrpcpb.Code_UNAVAILABLE, "no valid tablet")
+			err = vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "no healthy tablet available for '%s'", target.String())
 			break
 		}
 		shuffleTablets(dg.localCell, tablets)
@@ -311,7 +309,6 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		}
 
 		// execute
-		tabletLastUsed = ts.Tablet
 		conn := dg.hc.GetConnection(ts.Key)
 		if conn == nil {
 			err = vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "no connection for key %v tablet %+v", ts.Key, ts.Tablet)
@@ -329,7 +326,7 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		}
 		break
 	}
-	return NewShardError(err, target, tabletLastUsed)
+	return NewShardError(err, target)
 }
 
 func shuffleTablets(cell string, tablets []discovery.LegacyTabletStats) {
@@ -405,20 +402,6 @@ func (dg *DiscoveryGateway) getStatsAggregator(target *querypb.Target) *TabletSt
 	aggr = NewTabletStatusAggregator(target.Keyspace, target.Shard, target.TabletType, key)
 	dg.statusAggregators[key] = aggr
 	return aggr
-}
-
-// NewShardError returns a new error with the shard info amended.
-func NewShardError(in error, target *querypb.Target, tablet *topodatapb.Tablet) error {
-	if in == nil {
-		return nil
-	}
-	if tablet != nil {
-		return vterrors.Wrapf(in, "target: %s.%s.%s, used tablet: %s", target.Keyspace, target.Shard, topoproto.TabletTypeLString(target.TabletType), topotools.TabletIdent(tablet))
-	}
-	if target != nil {
-		return vterrors.Wrapf(in, "target: %s.%s.%s", target.Keyspace, target.Shard, topoproto.TabletTypeLString(target.TabletType))
-	}
-	return in
 }
 
 // QueryServiceByAlias satisfies the Gateway interface

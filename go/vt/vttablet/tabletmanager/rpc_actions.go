@@ -18,13 +18,11 @@ package tabletmanager
 
 import (
 	"fmt"
-	"regexp"
 	"time"
 
-	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/hook"
 	"vitess.io/vitess/go/vt/mysqlctl"
@@ -32,6 +30,17 @@ import (
 
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+)
+
+// DBAction is used to tell ChangeTabletType whether to call SetReadOnly on change to
+// MASTER tablet type
+type DBAction int
+
+// Allowed values for DBAction
+const (
+	DBActionNone = DBAction(iota)
+	DBActionSetReadWrite
 )
 
 // This file contains the implementations of RPCTM methods.
@@ -63,11 +72,11 @@ func (tm *TabletManager) ChangeType(ctx context.Context, tabletType topodatapb.T
 		return err
 	}
 	defer tm.unlock()
-	return tm.changeTypeLocked(ctx, tabletType)
+	return tm.changeTypeLocked(ctx, tabletType, DBActionNone)
 }
 
 // ChangeType changes the tablet type
-func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topodatapb.TabletType) error {
+func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topodatapb.TabletType, action DBAction) error {
 	// We don't want to allow multiple callers to claim a tablet as drained. There is a race that could happen during
 	// horizontal resharding where two vtworkers will try to DRAIN the same tablet. This check prevents that race from
 	// causing errors.
@@ -75,24 +84,9 @@ func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topoda
 		return fmt.Errorf("Tablet: %v, is already drained", tm.tabletAlias)
 	}
 
-	tablet := tm.Tablet()
-	tablet.Type = tabletType
-	// If we have been told we're master, set master term start time to Now
-	// and save it topo immediately.
-	if tabletType == topodatapb.TabletType_MASTER {
-		tablet.MasterTermStartTime = logutil.TimeToProto(time.Now())
-
-		// change our type in the topology, and set masterTermStartTime on tablet record if applicable
-		_, err := topotools.ChangeType(ctx, tm.TopoServer, tm.tabletAlias, tabletType, tablet.MasterTermStartTime)
-		if err != nil {
-			return err
-		}
-	} else {
-		tablet.MasterTermStartTime = nil
+	if err := tm.tmState.ChangeTabletType(ctx, tabletType, action); err != nil {
+		return err
 	}
-
-	// updateState will invoke broadcastHealth if needed.
-	tm.updateState(ctx, tablet, "ChangeType")
 
 	// Let's see if we need to fix semi-sync acking.
 	if err := tm.fixSemiSyncAndReplication(tm.Tablet().Type); err != nil {
@@ -132,25 +126,15 @@ func (tm *TabletManager) RefreshState(ctx context.Context) error {
 	}
 	defer tm.unlock()
 
-	return tm.refreshTablet(ctx, "RefreshState")
+	return tm.tmState.RefreshFromTopo(ctx)
 }
 
 // RunHealthCheck will manually run the health check on the tablet.
 func (tm *TabletManager) RunHealthCheck(ctx context.Context) {
-	tm.runHealthCheck()
+	tm.QueryServiceControl.BroadcastHealth()
 }
 
 // IgnoreHealthError sets the regexp for health check errors to ignore.
 func (tm *TabletManager) IgnoreHealthError(ctx context.Context, pattern string) error {
-	var expr *regexp.Regexp
-	if pattern != "" {
-		var err error
-		if expr, err = regexp.Compile(fmt.Sprintf("^%s$", pattern)); err != nil {
-			return err
-		}
-	}
-	tm.mutex.Lock()
-	tm._ignoreHealthErrorExpr = expr
-	tm.mutex.Unlock()
-	return nil
+	return vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "deprecated")
 }

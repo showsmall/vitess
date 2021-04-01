@@ -22,6 +22,7 @@ import (
 	"strconv"
 
 	"vitess.io/vitess/go/sqltypes"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
@@ -29,29 +30,41 @@ import (
 )
 
 // buildInsertPlan builds the route for an INSERT statement.
-func buildInsertPlan(stmt sqlparser.Statement, vschema ContextVSchema) (engine.Primitive, error) {
+func buildInsertPlan(stmt sqlparser.Statement, reservedVars sqlparser.BindVars, vschema ContextVSchema) (engine.Primitive, error) {
 	ins := stmt.(*sqlparser.Insert)
-	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(ins)))
+	pb := newPrimitiveBuilder(vschema, newJointab(reservedVars))
 	exprs := sqlparser.TableExprs{&sqlparser.AliasedTableExpr{Expr: ins.Table}}
-	ro, err := pb.processDMLTable(exprs)
+	rb, err := pb.processDMLTable(exprs, reservedVars, nil)
 	if err != nil {
 		return nil, err
 	}
 	// The table might have been routed to a different one.
 	ins.Table = exprs[0].(*sqlparser.AliasedTableExpr).Expr.(sqlparser.TableName)
-	if ro.eroute.TargetDestination != nil {
+	if rb.eroute.TargetDestination != nil {
 		return nil, errors.New("unsupported: INSERT with a target destination")
 	}
-	if !ro.vschemaTable.Keyspace.Sharded {
-		if !pb.finalizeUnshardedDMLSubqueries(ins) {
+
+	if len(pb.st.tables) != 1 {
+		// Unreachable.
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "multi-table insert statement in not supported in sharded keyspace")
+	}
+	var vschemaTable *vindexes.Table
+	for _, tval := range pb.st.tables {
+		// There is only one table.
+		vschemaTable = tval.vschemaTable
+	}
+	if !rb.eroute.Keyspace.Sharded {
+		if pb.finalizeUnshardedDMLSubqueries(reservedVars, ins) {
+			vschema.WarnUnshardedOnly("subqueries can't be sharded for INSERT")
+		} else {
 			return nil, errors.New("unsupported: sharded subquery in insert values")
 		}
-		return buildInsertUnshardedPlan(ins, ro.vschemaTable)
+		return buildInsertUnshardedPlan(ins, vschemaTable)
 	}
-	if ins.Action == sqlparser.ReplaceStr {
+	if ins.Action == sqlparser.ReplaceAct {
 		return nil, errors.New("unsupported: REPLACE INTO with sharded schema")
 	}
-	return buildInsertShardedPlan(ins, ro.vschemaTable)
+	return buildInsertShardedPlan(ins, vschemaTable)
 }
 
 func buildInsertUnshardedPlan(ins *sqlparser.Insert, table *vindexes.Table) (engine.Primitive, error) {
@@ -104,7 +117,7 @@ func buildInsertShardedPlan(ins *sqlparser.Insert, table *vindexes.Table) (engin
 		table,
 		table.Keyspace,
 	)
-	if ins.Ignore != "" {
+	if ins.Ignore {
 		eins.Opcode = engine.InsertShardedIgnore
 	}
 	if ins.OnDup != nil {
@@ -116,8 +129,6 @@ func buildInsertShardedPlan(ins *sqlparser.Insert, table *vindexes.Table) (engin
 	if len(ins.Columns) == 0 {
 		if table.ColumnListAuthoritative {
 			populateInsertColumnlist(ins, table)
-		} else {
-			return nil, errors.New("no column list")
 		}
 	}
 
@@ -173,7 +184,7 @@ func buildInsertShardedPlan(ins *sqlparser.Insert, table *vindexes.Table) (engin
 			colNum := findOrAddColumn(ins, col)
 			for rowNum, row := range rows {
 				name := ":" + engine.InsertVarName(col, rowNum)
-				row[colNum] = sqlparser.NewValArg([]byte(name))
+				row[colNum] = sqlparser.NewArgument(name)
 			}
 		}
 	}
@@ -197,7 +208,7 @@ func generateInsertShardedQuery(node *sqlparser.Insert, eins *engine.Insert, val
 	suffixBuf := sqlparser.NewTrackedBuffer(dmlFormatter)
 	eins.Mid = make([]string, len(valueTuples))
 	prefixBuf.Myprintf("insert %v%sinto %v%v values ",
-		node.Comments, node.Ignore,
+		node.Comments, node.Ignore.ToString(),
 		node.Table, node.Columns)
 	eins.Prefix = prefixBuf.String()
 	for rowNum, val := range valueTuples {
@@ -225,7 +236,7 @@ func modifyForAutoinc(ins *sqlparser.Insert, eins *engine.Insert) error {
 			return fmt.Errorf("could not compute value for vindex or auto-inc column: %v", err)
 		}
 		autoIncValues.Values = append(autoIncValues.Values, pv)
-		row[colNum] = sqlparser.NewValArg([]byte(":" + engine.SeqVarName + strconv.Itoa(rowNum)))
+		row[colNum] = sqlparser.NewArgument(":" + engine.SeqVarName + strconv.Itoa(rowNum))
 	}
 
 	eins.Generate = &engine.Generate{

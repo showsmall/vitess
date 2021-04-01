@@ -26,6 +26,8 @@ import (
 	"strings"
 
 	"github.com/golang/protobuf/proto"
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -89,6 +91,17 @@ func ParseTabletAlias(aliasStr string) (*topodatapb.TabletAlias, error) {
 	}, nil
 }
 
+// ParseTabletSet returns a set of tablets based on a provided comma separated list of tablets.
+func ParseTabletSet(tabletListStr string) sets.String {
+	set := sets.NewString()
+	if tabletListStr == "" {
+		return set
+	}
+	list := strings.Split(tabletListStr, ",")
+	set.Insert(list...)
+	return set
+}
+
 // ParseUID parses just the uid (a number)
 func ParseUID(value string) (uint32, error) {
 	uid, err := strconv.ParseUint(value, 10, 32)
@@ -121,22 +134,21 @@ func (tal TabletAliasList) Swap(i, j int) {
 	tal[i], tal[j] = tal[j], tal[i]
 }
 
+// ToStringSlice returns a slice which is the result of mapping
+// TabletAliasString over a slice of TabletAliases.
+func (tal TabletAliasList) ToStringSlice() []string {
+	result := make([]string, len(tal))
+
+	for i, alias := range tal {
+		result[i] = TabletAliasString(alias)
+	}
+
+	return result
+}
+
 // AllTabletTypes lists all the possible tablet types
 var AllTabletTypes = []topodatapb.TabletType{
 	topodatapb.TabletType_MASTER,
-	topodatapb.TabletType_REPLICA,
-	topodatapb.TabletType_RDONLY,
-	topodatapb.TabletType_BATCH,
-	topodatapb.TabletType_SPARE,
-	topodatapb.TabletType_EXPERIMENTAL,
-	topodatapb.TabletType_BACKUP,
-	topodatapb.TabletType_RESTORE,
-	topodatapb.TabletType_DRAINED,
-}
-
-// SlaveTabletTypes contains all the tablet type that can have replication
-// enabled.
-var SlaveTabletTypes = []topodatapb.TabletType{
 	topodatapb.TabletType_REPLICA,
 	topodatapb.TabletType_RDONLY,
 	topodatapb.TabletType_BATCH,
@@ -180,7 +192,7 @@ func TabletTypeLString(tabletType topodatapb.TabletType) string {
 }
 
 // IsTypeInList returns true if the given type is in the list.
-// Use it with AllTabletType and SlaveTabletType for instance.
+// Use it with AllTabletTypes for instance.
 func IsTypeInList(tabletType topodatapb.TabletType, types []topodatapb.TabletType) bool {
 	for _, t := range types {
 		if tabletType == t {

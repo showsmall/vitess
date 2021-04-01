@@ -29,8 +29,9 @@ import (
 
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/history"
 	"vitess.io/vitess/go/mysql"
@@ -79,10 +80,34 @@ type Stats struct {
 	lastPositionMutex sync.Mutex
 	lastPosition      mysql.Position
 
+	heartbeatMutex sync.Mutex
+	heartbeat      int64
+
 	SecondsBehindMaster sync2.AtomicInt64
 	History             *history.History
 
 	State sync2.AtomicString
+
+	PhaseTimings  *stats.Timings
+	QueryTimings  *stats.Timings
+	QueryCount    *stats.CountersWithSingleLabel
+	CopyRowCount  *stats.Counter
+	CopyLoopCount *stats.Counter
+	ErrorCounts   *stats.CountersWithMultiLabels
+}
+
+// RecordHeartbeat updates the time the last heartbeat from vstreamer was seen
+func (bps *Stats) RecordHeartbeat(tm int64) {
+	bps.heartbeatMutex.Lock()
+	defer bps.heartbeatMutex.Unlock()
+	bps.heartbeat = tm
+}
+
+// Heartbeat gets the time the last heartbeat from vstreamer was seen
+func (bps *Stats) Heartbeat() int64 {
+	bps.heartbeatMutex.Lock()
+	defer bps.heartbeatMutex.Unlock()
+	return bps.heartbeat
 }
 
 // SetLastPosition sets the last replication position.
@@ -118,6 +143,12 @@ func NewStats() *Stats {
 	bps.Rates = stats.NewRates("", bps.Timings, 15*60/5, 5*time.Second)
 	bps.History = history.New(3)
 	bps.SecondsBehindMaster.Set(math.MaxInt64)
+	bps.PhaseTimings = stats.NewTimings("", "", "Phase")
+	bps.QueryTimings = stats.NewTimings("", "", "Phase")
+	bps.QueryCount = stats.NewCountersWithSingleLabel("", "", "Phase", "")
+	bps.CopyRowCount = stats.NewCounter("", "")
+	bps.CopyLoopCount = stats.NewCounter("", "")
+	bps.ErrorCounts = stats.NewCountersWithMultiLabels("", "", []string{"type"})
 	return bps
 }
 
@@ -519,6 +550,8 @@ func CreateVReplicationTable() []string {
 // AlterVReplicationTable adds new columns to vreplication table
 var AlterVReplicationTable = []string{
 	"ALTER TABLE _vt.vreplication ADD COLUMN db_name VARBINARY(255) NOT NULL",
+	"ALTER TABLE _vt.vreplication MODIFY source BLOB NOT NULL",
+	"ALTER TABLE _vt.vreplication ADD KEY workflow_idx (workflow(64))",
 }
 
 // VRSettings contains the settings of a vreplication table.
@@ -599,6 +632,14 @@ func GenerateUpdatePos(uid uint32, pos mysql.Position, timeUpdated int64, txTime
 	return fmt.Sprintf(
 		"update _vt.vreplication set pos=%v, time_updated=%v, message='' where id=%v",
 		encodeString(mysql.EncodePosition(pos)), timeUpdated, uid)
+}
+
+// GenerateUpdateTime returns a statement to update time_updated in the _vt.vreplication table.
+func GenerateUpdateTime(uid uint32, timeUpdated int64) (string, error) {
+	if timeUpdated == 0 {
+		return "", fmt.Errorf("timeUpdated cannot be zero")
+	}
+	return fmt.Sprintf("update _vt.vreplication set time_updated=%v where id=%v", timeUpdated, uid), nil
 }
 
 // StartVReplication returns a statement to start the replication.

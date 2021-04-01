@@ -3,21 +3,27 @@ package vreplication
 var (
 	initialProductSchema = `
 create table product(pid int, description varbinary(128), primary key(pid));
-create table customer(cid int, name varbinary(128),	primary key(cid));
-create table merchant(mname varchar(128), category varchar(128), primary key(mname));
-create table orders(oid int, cid int, pid int, mname varchar(128), price int, primary key(oid));
+create table customer(cid int, name varbinary(128), meta json default null, typ enum('individual','soho','enterprise'), sport set('football','cricket','baseball'),ts timestamp not null default current_timestamp, primary key(cid))  CHARSET=utf8mb4;
 create table customer_seq(id int, next_id bigint, cache bigint, primary key(id)) comment 'vitess_sequence';
+create table merchant(mname varchar(128), category varchar(128), primary key(mname)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+create table orders(oid int, cid int, pid int, mname varchar(128), price int, primary key(oid));
 create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) comment 'vitess_sequence';
+create table customer2(cid int, name varbinary(128), typ enum('individual','soho','enterprise'), sport set('football','cricket','baseball'),ts timestamp not null default current_timestamp, primary key(cid));
+create table customer_seq2(id int, next_id bigint, cache bigint, primary key(id)) comment 'vitess_sequence';
 `
 
 	initialProductVSchema = `
 {
   "tables": {
 	"product": {},
-	"customer": {},
 	"merchant": {},
 	"orders": {},
+	"customer": {},
 	"customer_seq": {
+		"type": "sequence"
+	},
+	"customer2": {},
+	"customer_seq2": {
 		"type": "sequence"
 	},
 	"order_seq": {
@@ -46,6 +52,18 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
 	      "auto_increment": {
 	        "column": "cid",
 	        "sequence": "customer_seq"
+	      }
+	    },
+	    "customer2": {
+	      "column_vindexes": [
+	        {
+	          "column": "cid",
+	          "name": "reverse_bits"
+	        }
+	      ],
+	      "auto_increment": {
+	        "column": "cid",
+	        "sequence": "customer_seq2"
 	      }
 	    }
    }
@@ -146,6 +164,9 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
     },
 	"cproduct": {
 		"type": "reference"
+	},
+	"vproduct": {
+		"type": "reference"
 	}
   }
 }
@@ -195,7 +216,7 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
 	  	"msales": {
 		  "column_vindexes": [
 			{
-			  "column": "mname",
+			  "column": "merchant_name",
 			  "name": "md5"
 			}
 		  ]
@@ -215,6 +236,7 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
   }]
 }
 `
+
 	materializeMerchantSalesSpec = `
 {
   "workflow": "msales",
@@ -222,8 +244,8 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
   "targetKeyspace": "merchant",
   "tableSettings": [{
     "targetTable": "msales",
-    "sourceExpression": "select mname, count(*) as kount, sum(price) as amount from orders group by mname",
-    "create_ddl": "create table msales(mname varchar(128), kount int, amount int, primary key(mname))"
+	"sourceExpression": "select mname as merchant_name, count(*) as kount, sum(price) as amount from orders group by merchant_name",
+    "create_ddl": "create table msales(merchant_name varchar(128), kount int, amount int, primary key(merchant_name))"
   }]
 }
 `
@@ -252,6 +274,31 @@ create table order_seq(id int, next_id bigint, cache bigint, primary key(id)) co
     "sourceExpression": "select pid, count(*) as kount, sum(price) as amount from orders group by pid",
     "create_ddl": "create table sales(pid int, kount int, amount int, primary key(pid))"
   }]
+}
+`
+	materializeRollupSpec = `
+{
+  "workflow": "rollup",
+  "sourceKeyspace": "product",
+  "targetKeyspace": "product",
+  "tableSettings": [{
+    "targetTable": "rollup",
+    "sourceExpression": "select 'total' as rollupname, count(*) as kount from product group by rollupname",
+    "create_ddl": "create table rollup(rollupname varchar(100), kount int, primary key (rollupname))"
+  }]
+}
+`
+	initialExternalSchema = `
+create table review(rid int, pid int, review varbinary(128), primary key(rid));
+create table rating(gid int, pid int, rating int, primary key(gid));
+`
+
+	initialExternalVSchema = `
+{
+  "tables": {
+	"review": {},
+	"rating": {}
+  }
 }
 `
 )

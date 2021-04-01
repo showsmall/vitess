@@ -29,11 +29,15 @@ import (
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/vt/log"
-	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/servenv"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/sysvars"
+
+	"context"
+
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/log"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/cache"
@@ -53,11 +57,15 @@ import (
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
+// this is the healthcheck used by vtgate, used by the "vstream * from" functionality
+var vtgateHealthCheck discovery.HealthCheck
+
 var (
-	errNoKeyspace     = vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "no keyspace in database name specified. Supported database name format (items in <> are optional): keyspace<:shard><@type> or keyspace<[range]><@type>")
+	errNoKeyspace     = vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.NoDB, "No database selected: use keyspace<:shard><@type> or keyspace<[range]><@type> (<> are optional)")
 	defaultTabletType topodatapb.TabletType
 
 	// TODO: @rafael - These two counters should be deprecated in favor of the ByTable ones. They are kept for now for backwards compatibility.
@@ -69,10 +77,11 @@ var (
 )
 
 const (
-	utf8    = "utf8"
-	utf8mb4 = "utf8mb4"
-	both    = "both"
-	charset = "charset"
+	utf8          = "utf8"
+	utf8mb4       = "utf8mb4"
+	both          = "both"
+	charset       = "charset"
+	bindVarPrefix = "__vt"
 )
 
 func init() {
@@ -90,10 +99,12 @@ type Executor struct {
 
 	mu           sync.Mutex
 	vschema      *vindexes.VSchema
-	normalize    bool
 	streamSize   int
-	plans        *cache.LRUCache
+	plans        cache.Cache
 	vschemaStats *VSchemaStats
+
+	normalize       bool
+	warnShardedOnly bool
 
 	vm *VSchemaManager
 }
@@ -105,16 +116,17 @@ const pathScatterStats = "/debug/scatter_stats"
 const pathVSchema = "/debug/vschema"
 
 // NewExecutor creates a new Executor.
-func NewExecutor(ctx context.Context, serv srvtopo.Server, cell string, resolver *Resolver, normalize bool, streamSize int, queryPlanCacheSize int64) *Executor {
+func NewExecutor(ctx context.Context, serv srvtopo.Server, cell string, resolver *Resolver, normalize, warnOnShardedOnly bool, streamSize int, cacheCfg *cache.Config) *Executor {
 	e := &Executor{
-		serv:        serv,
-		cell:        cell,
-		resolver:    resolver,
-		scatterConn: resolver.scatterConn,
-		txConn:      resolver.scatterConn.txConn,
-		plans:       cache.NewLRUCache(queryPlanCacheSize),
-		normalize:   normalize,
-		streamSize:  streamSize,
+		serv:            serv,
+		cell:            cell,
+		resolver:        resolver,
+		scatterConn:     resolver.scatterConn,
+		txConn:          resolver.scatterConn.txConn,
+		plans:           cache.NewDefaultCacheImpl(cacheCfg),
+		normalize:       normalize,
+		warnShardedOnly: warnOnShardedOnly,
+		streamSize:      streamSize,
 	}
 
 	vschemaacl.Init()
@@ -122,13 +134,12 @@ func NewExecutor(ctx context.Context, serv srvtopo.Server, cell string, resolver
 	e.vm.watchSrvVSchema(ctx, cell)
 
 	executorOnce.Do(func() {
-		stats.NewGaugeFunc("QueryPlanCacheLength", "Query plan cache length", e.plans.Length)
-		stats.NewGaugeFunc("QueryPlanCacheSize", "Query plan cache size", e.plans.Size)
-		stats.NewGaugeFunc("QueryPlanCacheCapacity", "Query plan cache capacity", e.plans.Capacity)
+		stats.NewGaugeFunc("QueryPlanCacheLength", "Query plan cache length", func() int64 {
+			return int64(e.plans.Len())
+		})
+		stats.NewGaugeFunc("QueryPlanCacheSize", "Query plan cache size", e.plans.UsedCapacity)
+		stats.NewGaugeFunc("QueryPlanCacheCapacity", "Query plan cache capacity", e.plans.MaxCapacity)
 		stats.NewCounterFunc("QueryPlanCacheEvictions", "Query plan cache evictions", e.plans.Evictions)
-		stats.Publish("QueryPlanCacheOldest", stats.StringFunc(func() string {
-			return fmt.Sprintf("%v", e.plans.Oldest())
-		}))
 		http.Handle(pathQueryPlans, e)
 		http.Handle(pathScatterStats, e)
 		http.Handle(pathVSchema, e)
@@ -149,6 +160,11 @@ func (e *Executor) Execute(ctx context.Context, method string, safeSession *Safe
 	saveSessionStats(safeSession, stmtType, result, err)
 	if result != nil && len(result.Rows) > *warnMemoryRows {
 		warnings.Add("ResultsExceeded", 1)
+		piiSafeSQL, err := sqlparser.RedactSQLQuery(sql)
+		if err != nil {
+			piiSafeSQL = logStats.StmtType
+		}
+		log.Warningf("%q exceeds warning threshold of max memory rows: %v", piiSafeSQL, *warnMemoryRows)
 	}
 
 	logStats.Send()
@@ -160,14 +176,16 @@ func saveSessionStats(safeSession *SafeSession, stmtType sqlparser.StatementType
 	if err != nil {
 		return
 	}
-	safeSession.FoundRows = result.RowsAffected
+	if !safeSession.foundRowsHandled {
+		safeSession.FoundRows = uint64(len(result.Rows))
+	}
 	if result.InsertID > 0 {
 		safeSession.LastInsertId = result.InsertID
 	}
 	switch stmtType {
 	case sqlparser.StmtInsert, sqlparser.StmtReplace, sqlparser.StmtUpdate, sqlparser.StmtDelete:
 		safeSession.RowCount = int64(result.RowsAffected)
-	case sqlparser.StmtDDL, sqlparser.StmtSet, sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtRollback:
+	case sqlparser.StmtDDL, sqlparser.StmtSet, sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtRollback, sqlparser.StmtFlush:
 		safeSession.RowCount = 0
 	}
 }
@@ -197,7 +215,7 @@ func (e *Executor) legacyExecute(ctx context.Context, safeSession *SafeSession, 
 	logStats.TabletType = destTabletType.String()
 	// Legacy gateway allows transactions only on MASTER
 	if UsingLegacyGateway() && safeSession.InTransaction() && destTabletType != topodatapb.TabletType_MASTER {
-		return 0, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Executor.execute: transactions are supported only for master tablet types, current type: %v", destTabletType)
+		return 0, nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "transaction is supported only for master tablet type, current type: %v", destTabletType)
 	}
 	if bindVars == nil {
 		bindVars = make(map[string]*querypb.BindVariable)
@@ -219,10 +237,10 @@ func (e *Executor) legacyExecute(ctx context.Context, safeSession *SafeSession, 
 
 	switch stmtType {
 	case sqlparser.StmtSelect, sqlparser.StmtInsert, sqlparser.StmtReplace, sqlparser.StmtUpdate,
-		sqlparser.StmtDelete, sqlparser.StmtDDL, sqlparser.StmtUse, sqlparser.StmtExplain, sqlparser.StmtOther:
-		return 0, nil, vterrors.New(vtrpcpb.Code_INTERNAL, "BUG: not reachable as handled with plan execute")
+		sqlparser.StmtDelete, sqlparser.StmtDDL, sqlparser.StmtUse, sqlparser.StmtExplain, sqlparser.StmtOther, sqlparser.StmtFlush:
+		return 0, nil, vterrors.New(vtrpcpb.Code_INTERNAL, "[BUG] not reachable, should be handled with plan execute")
 	case sqlparser.StmtSet:
-		qr, err := e.handleSet(ctx, safeSession, sql, logStats)
+		qr, err := e.handleSet(ctx, sql, logStats)
 		return sqlparser.StmtSet, qr, err
 	case sqlparser.StmtShow:
 		qr, err := e.handleShow(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
@@ -232,17 +250,88 @@ func (e *Executor) legacyExecute(ctx context.Context, safeSession *SafeSession, 
 		// There are some statements which are not planned for special comments.
 		return sqlparser.StmtComment, &sqltypes.Result{}, nil
 	}
-	return 0, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unrecognized statement: %s", sql)
+	return 0, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] statement not handled: %s", sql)
 }
 
 // addNeededBindVars adds bind vars that are needed by the plan
-func (e *Executor) addNeededBindVars(bindVarNeeds sqlparser.BindVarNeeds, bindVars map[string]*querypb.BindVariable, session *SafeSession) error {
-	if bindVarNeeds.NeedDatabase {
-		bindVars[sqlparser.DBVarName] = sqltypes.StringBindVariable(session.TargetString)
+func (e *Executor) addNeededBindVars(bindVarNeeds *sqlparser.BindVarNeeds, bindVars map[string]*querypb.BindVariable, session *SafeSession) error {
+	for _, funcName := range bindVarNeeds.NeedFunctionResult {
+		switch funcName {
+		case sqlparser.DBVarName:
+			bindVars[sqlparser.DBVarName] = sqltypes.StringBindVariable(session.TargetString)
+		case sqlparser.LastInsertIDName:
+			bindVars[sqlparser.LastInsertIDName] = sqltypes.Uint64BindVariable(session.GetLastInsertId())
+		case sqlparser.FoundRowsName:
+			bindVars[sqlparser.FoundRowsName] = sqltypes.Uint64BindVariable(session.FoundRows)
+		case sqlparser.RowCountName:
+			bindVars[sqlparser.RowCountName] = sqltypes.Int64BindVariable(session.RowCount)
+		}
 	}
 
-	if bindVarNeeds.NeedLastInsertID {
-		bindVars[sqlparser.LastInsertIDName] = sqltypes.Uint64BindVariable(session.GetLastInsertId())
+	for _, sysVar := range bindVarNeeds.NeedSystemVariable {
+		key := bindVarPrefix + sysVar
+		switch sysVar {
+		case sysvars.Autocommit.Name:
+			bindVars[key] = sqltypes.BoolBindVariable(session.Autocommit)
+		case sysvars.ClientFoundRows.Name:
+			var v bool
+			ifOptionsExist(session, func(options *querypb.ExecuteOptions) {
+				v = options.ClientFoundRows
+			})
+			bindVars[key] = sqltypes.BoolBindVariable(v)
+		case sysvars.SkipQueryPlanCache.Name:
+			var v bool
+			ifOptionsExist(session, func(options *querypb.ExecuteOptions) {
+				v = options.ClientFoundRows
+			})
+			bindVars[key] = sqltypes.BoolBindVariable(v)
+		case sysvars.SQLSelectLimit.Name:
+			var v int64
+			ifOptionsExist(session, func(options *querypb.ExecuteOptions) {
+				v = options.SqlSelectLimit
+			})
+			bindVars[key] = sqltypes.Int64BindVariable(v)
+		case sysvars.TransactionMode.Name:
+			bindVars[key] = sqltypes.StringBindVariable(session.TransactionMode.String())
+		case sysvars.Workload.Name:
+			var v string
+			ifOptionsExist(session, func(options *querypb.ExecuteOptions) {
+				v = options.GetWorkload().String()
+			})
+			bindVars[key] = sqltypes.StringBindVariable(v)
+		case sysvars.DDLStrategy.Name:
+			bindVars[key] = sqltypes.StringBindVariable(session.DDLStrategy)
+		case sysvars.SessionUUID.Name:
+			bindVars[key] = sqltypes.StringBindVariable(session.SessionUUID)
+		case sysvars.SessionEnableSystemSettings.Name:
+			bindVars[key] = sqltypes.BoolBindVariable(session.EnableSystemSettings)
+		case sysvars.ReadAfterWriteGTID.Name:
+			var v string
+			ifReadAfterWriteExist(session, func(raw *vtgatepb.ReadAfterWrite) {
+				v = raw.ReadAfterWriteGtid
+			})
+			bindVars[key] = sqltypes.StringBindVariable(v)
+		case sysvars.ReadAfterWriteTimeOut.Name:
+			var v float64
+			ifReadAfterWriteExist(session, func(raw *vtgatepb.ReadAfterWrite) {
+				v = raw.ReadAfterWriteTimeout
+			})
+			bindVars[key] = sqltypes.Float64BindVariable(v)
+		case sysvars.SessionTrackGTIDs.Name:
+			v := "off"
+			ifReadAfterWriteExist(session, func(raw *vtgatepb.ReadAfterWrite) {
+				if raw.SessionTrackGtids {
+					v = "own_gtid"
+				}
+			})
+			bindVars[key] = sqltypes.StringBindVariable(v)
+		case sysvars.Version.Name:
+			bindVars[key] = sqltypes.StringBindVariable(servenv.AppVersion.MySQLVersion())
+		case sysvars.VersionComment.Name:
+			bindVars[key] = sqltypes.StringBindVariable(servenv.AppVersion.String())
+		case sysvars.Socket.Name:
+			bindVars[key] = sqltypes.StringBindVariable(mysqlSocketPath())
+		}
 	}
 
 	udvMap := session.UserDefinedVariables
@@ -257,22 +346,28 @@ func (e *Executor) addNeededBindVars(bindVarNeeds sqlparser.BindVarNeeds, bindVa
 		bindVars[sqlparser.UserDefinedVariableName+udv] = val
 	}
 
-	if bindVarNeeds.NeedFoundRows {
-		bindVars[sqlparser.FoundRowsName] = sqltypes.Uint64BindVariable(session.FoundRows)
-	}
-
-	if bindVarNeeds.NeedRowCount {
-		bindVars[sqlparser.RowCountName] = sqltypes.Int64BindVariable(session.RowCount)
-	}
-
 	return nil
 }
 
-func (e *Executor) destinationExec(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, dest key.Destination, destKeyspace string, destTabletType topodatapb.TabletType, logStats *LogStats) (*sqltypes.Result, error) {
-	return e.resolver.Execute(ctx, sql, bindVars, destKeyspace, destTabletType, dest, safeSession, false /* notInTransaction */, safeSession.Options, logStats, false /* canAutocommit */)
+func ifOptionsExist(session *SafeSession, f func(*querypb.ExecuteOptions)) {
+	options := session.GetOptions()
+	if options != nil {
+		f(options)
+	}
 }
 
-func (e *Executor) handleBegin(ctx context.Context, safeSession *SafeSession, destTabletType topodatapb.TabletType, logStats *LogStats) (*sqltypes.Result, error) {
+func ifReadAfterWriteExist(session *SafeSession, f func(*vtgatepb.ReadAfterWrite)) {
+	raw := session.ReadAfterWrite
+	if raw != nil {
+		f(raw)
+	}
+}
+
+func (e *Executor) destinationExec(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, dest key.Destination, destKeyspace string, destTabletType topodatapb.TabletType, logStats *LogStats, ignoreMaxMemoryRows bool) (*sqltypes.Result, error) {
+	return e.resolver.Execute(ctx, sql, bindVars, destKeyspace, destTabletType, dest, safeSession, safeSession.Options, logStats, false /* canAutocommit */, ignoreMaxMemoryRows)
+}
+
+func (e *Executor) handleBegin(ctx context.Context, safeSession *SafeSession, logStats *LogStats) (*sqltypes.Result, error) {
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	err := e.txConn.Begin(ctx, safeSession)
@@ -286,7 +381,7 @@ func (e *Executor) handleBegin(ctx context.Context, safeSession *SafeSession, de
 func (e *Executor) handleCommit(ctx context.Context, safeSession *SafeSession, logStats *LogStats) (*sqltypes.Result, error) {
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
-	logStats.ShardQueries = uint32(len(safeSession.ShardSessions))
+	logStats.ShardQueries = uint64(len(safeSession.ShardSessions))
 	e.updateQueryCounts("Commit", "", "", int64(logStats.ShardQueries))
 
 	err := e.txConn.Commit(ctx, safeSession)
@@ -294,28 +389,70 @@ func (e *Executor) handleCommit(ctx context.Context, safeSession *SafeSession, l
 	return &sqltypes.Result{}, err
 }
 
+//Commit commits the existing transactions
+func (e *Executor) Commit(ctx context.Context, safeSession *SafeSession) error {
+	return e.txConn.Commit(ctx, safeSession)
+}
+
 func (e *Executor) handleRollback(ctx context.Context, safeSession *SafeSession, logStats *LogStats) (*sqltypes.Result, error) {
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
-	logStats.ShardQueries = uint32(len(safeSession.ShardSessions))
+	logStats.ShardQueries = uint64(len(safeSession.ShardSessions))
 	e.updateQueryCounts("Rollback", "", "", int64(logStats.ShardQueries))
-	err := e.CloseSession(ctx, safeSession)
+	err := e.txConn.Rollback(ctx, safeSession)
 	logStats.CommitTime = time.Since(execStart)
 	return &sqltypes.Result{}, err
 }
 
-// CloseSession closes the current transaction, if any. It is called both for explicit "rollback"
-// statements and implicitly when the mysql server closes the connection.
-func (e *Executor) CloseSession(ctx context.Context, safeSession *SafeSession) error {
-	return e.txConn.Rollback(ctx, safeSession)
-}
+func (e *Executor) handleSavepoint(ctx context.Context, safeSession *SafeSession, sql string, planType string, logStats *LogStats, nonTxResponse func(query string) (*sqltypes.Result, error), ignoreMaxMemoryRows bool) (*sqltypes.Result, error) {
+	execStart := time.Now()
+	logStats.PlanTime = execStart.Sub(logStats.StartTime)
+	logStats.ShardQueries = uint64(len(safeSession.ShardSessions))
+	e.updateQueryCounts(planType, "", "", int64(logStats.ShardQueries))
+	defer func() {
+		logStats.ExecuteTime = time.Since(execStart)
+	}()
 
-func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql string, logStats *LogStats) (*sqltypes.Result, error) {
-	stmt, err := sqlparser.Parse(sql)
+	if len(safeSession.ShardSessions) == 0 {
+		if safeSession.InTransaction() {
+			// Storing, as this needs to be executed just after starting transaction on the shard.
+			safeSession.StoreSavepoint(sql)
+			return &sqltypes.Result{}, nil
+		}
+		return nonTxResponse(sql)
+	}
+	var rss []*srvtopo.ResolvedShard
+	for _, shardSession := range safeSession.ShardSessions {
+		rss = append(rss, &srvtopo.ResolvedShard{
+			Target:  shardSession.Target,
+			Gateway: e.resolver.resolver.GetGateway(),
+		})
+	}
+	queries := make([]*querypb.BoundQuery, len(rss))
+	for i := range rss {
+		queries[i] = &querypb.BoundQuery{Sql: sql}
+	}
+	qr, errs := e.ExecuteMultiShard(ctx, rss, queries, safeSession, false /*autocommit*/, ignoreMaxMemoryRows)
+	err := vterrors.Aggregate(errs)
 	if err != nil {
 		return nil, err
 	}
-	rewrittenAST, err := sqlparser.PrepareAST(stmt, nil, "vtg", false)
+	safeSession.StoreSavepoint(sql)
+	return qr, nil
+}
+
+// CloseSession releases the current connection, which rollbacks open transactions and closes reserved connections.
+// It is called then the MySQL servers closes the connection to its client.
+func (e *Executor) CloseSession(ctx context.Context, safeSession *SafeSession) error {
+	return e.txConn.ReleaseAll(ctx, safeSession)
+}
+
+func (e *Executor) handleSet(ctx context.Context, sql string, logStats *LogStats) (*sqltypes.Result, error) {
+	stmt, reservedVars, err := sqlparser.Parse2(sql)
+	if err != nil {
+		return nil, err
+	}
+	rewrittenAST, err := sqlparser.PrepareAST(stmt, reservedVars, nil, "vtg", false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -338,33 +475,29 @@ func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql 
 		logStats.ExecuteTime = time.Since(execStart)
 	}()
 
+	var value interface{}
 	for _, expr := range set.Exprs {
 		// This is what correctly allows us to handle queries such as "set @@session.`autocommit`=1"
 		// it will remove backticks and double quotes that might surround the part after the first period
 		_, out := sqlparser.NewStringTokenizer(expr.Name.Lowered()).Scan()
 		name := string(out)
 		switch expr.Scope {
-		case sqlparser.GlobalStr:
-			return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported in set: global")
-		case sqlparser.SessionStr:
-			value, err := getValueFor(expr)
-			if err != nil {
-				return nil, err
-			}
-			return &sqltypes.Result{}, handleSessionSetting(ctx, name, safeSession, value, e.txConn, sql)
-		case sqlparser.VitessMetadataStr:
-			value, err := getValueFor(expr)
+		case sqlparser.VitessMetadataScope:
+			value, err = getValueFor(expr)
 			if err != nil {
 				return nil, err
 			}
 			val, ok := value.(string)
 			if !ok {
-				return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for charset: %v", value)
+				return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongValueForVar, "unexpected value type for '%s': %v", name, value)
 			}
-			return e.handleSetVitessMetadata(ctx, name, val)
-		case "": // we should only get here with UDVs
-			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "should have been handled by planning")
+			_, err = e.handleSetVitessMetadata(ctx, name, val)
+		default:
+			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unreachable statement: %s", sql)
 
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -373,7 +506,7 @@ func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql 
 
 func getValueFor(expr *sqlparser.SetExpr) (interface{}, error) {
 	switch expr := expr.Expr.(type) {
-	case *sqlparser.SQLVal:
+	case *sqlparser.Literal:
 		switch expr.Type {
 		case sqlparser.StrVal:
 			return strings.ToLower(string(expr.Val)), nil
@@ -407,188 +540,14 @@ func getValueFor(expr *sqlparser.SetExpr) (interface{}, error) {
 	default:
 		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid syntax: %s", sqlparser.String(expr))
 	}
-
-}
-
-func handleSessionSetting(ctx context.Context, name string, session *SafeSession, value interface{}, conn *TxConn, sql string) error {
-	switch name {
-	case "autocommit":
-		val, err := validateSetOnOff(value, name)
-		if err != nil {
-			return err
-		}
-
-		switch val {
-		case 0:
-			session.Autocommit = false
-		case 1:
-			if session.InTransaction() {
-				if err := conn.Commit(ctx, session); err != nil {
-					return err
-				}
-			}
-			session.Autocommit = true
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for autocommit: %d", val)
-		}
-	case "client_found_rows":
-		val, ok := value.(int64)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for client_found_rows: %T", value)
-		}
-		if session.Options == nil {
-			session.Options = &querypb.ExecuteOptions{}
-		}
-		switch val {
-		case 0:
-			session.Options.ClientFoundRows = false
-		case 1:
-			session.Options.ClientFoundRows = true
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for client_found_rows: %d", val)
-		}
-	case "skip_query_plan_cache":
-		val, ok := value.(int64)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for skip_query_plan_cache: %T", value)
-		}
-		if session.Options == nil {
-			session.Options = &querypb.ExecuteOptions{}
-		}
-		switch val {
-		case 0:
-			session.Options.SkipQueryPlanCache = false
-		case 1:
-			session.Options.SkipQueryPlanCache = true
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for skip_query_plan_cache: %d", val)
-		}
-	case "sql_safe_updates":
-		val, err := validateSetOnOff(value, name)
-		if err != nil {
-			return err
-		}
-
-		switch val {
-		case 0, 1:
-			// no op
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for sql_safe_updates: %d", val)
-		}
-	case "transaction_mode":
-		val, ok := value.(string)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for transaction_mode: %T", value)
-		}
-		out, ok := vtgatepb.TransactionMode_value[strings.ToUpper(val)]
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid transaction_mode: %s", val)
-		}
-		session.TransactionMode = vtgatepb.TransactionMode(out)
-	case "tx_isolation": // TODO move this to set tx
-		val, ok := value.(string)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for tx_isolation: %T", value)
-		}
-		switch val {
-		case "repeatable read", "read committed", "read uncommitted", "serializable":
-			// TODO (4127): This is a dangerous NOP.
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for tx_isolation: %v", val)
-		}
-	case "tx_read_only", "transaction_read_only": // TODO move this to set tx
-		val, err := validateSetOnOff(value, name)
-		if err != nil {
-			return err
-		}
-		switch val {
-		case 0, 1:
-			// TODO (4127): This is a dangerous NOP.
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for %v: %d", name, val)
-		}
-	case "workload":
-		val, ok := value.(string)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for workload: %T", value)
-		}
-		out, ok := querypb.ExecuteOptions_Workload_value[strings.ToUpper(val)]
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid workload: %s", val)
-		}
-		if session.Options == nil {
-			session.Options = &querypb.ExecuteOptions{}
-		}
-		session.Options.Workload = querypb.ExecuteOptions_Workload(out)
-	case "sql_select_limit":
-		var val int64
-
-		switch cast := value.(type) {
-		case int64:
-			val = cast
-		case string:
-			if !strings.EqualFold(cast, "default") {
-				return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected string value for sql_select_limit: %v", value)
-			}
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for sql_select_limit: %T", value)
-		}
-
-		if session.Options == nil {
-			session.Options = &querypb.ExecuteOptions{}
-		}
-		session.Options.SqlSelectLimit = val
-	case "sql_auto_is_null":
-		val, ok := value.(int64)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for sql_auto_is_null: %T", value)
-		}
-		switch val {
-		case 0:
-			// This is the default setting for MySQL. Do nothing.
-		case 1:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "sql_auto_is_null is not currently supported")
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for sql_auto_is_null: %d", val)
-		}
-	case "character_set_results":
-		// This is a statement that mysql-connector-j sends at the beginning. We return a canned response for it.
-		switch value {
-		case nil, "binary", "utf8", "utf8mb4", "latin1":
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "disallowed value for character_set_results: %v", value)
-		}
-	case "wait_timeout":
-		_, ok := value.(int64)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for wait_timeout: %T", value)
-		}
-	case "sql_mode", "net_write_timeout", "net_read_timeout", "lc_messages", "collation_connection", "foreign_key_checks", "sql_quote_show_create", "unique_checks":
-		log.Warningf("Ignored inapplicable SET %v = %v", name, value)
-		warnings.Add("IgnoredSet", 1)
-	case "charset", "names":
-		val, ok := value.(string)
-		if !ok {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for charset/names: %T", value)
-		}
-		switch val {
-		case "", "utf8", "utf8mb4", "latin1", "default":
-			break
-		default:
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for charset/names: %v", val)
-		}
-	default:
-		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported construct: %s", sql)
-	}
-	return nil
 }
 
 func (e *Executor) handleSetVitessMetadata(ctx context.Context, name, value string) (*sqltypes.Result, error) {
 	//TODO(kalfonso): move to its own acl check and consolidate into an acl component that can handle multiple operations (vschema, metadata)
-	allowed := vschemaacl.Authorized(callerid.ImmediateCallerIDFromContext(ctx))
+	user := callerid.ImmediateCallerIDFromContext(ctx)
+	allowed := vschemaacl.Authorized(user)
 	if !allowed {
-		return nil, vterrors.Errorf(vtrpcpb.Code_PERMISSION_DENIED, "not authorized to perform vitess metadata operations")
-
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_PERMISSION_DENIED, vterrors.AccessDeniedError, "User '%s' not authorized to perform vitess metadata operations", user.GetUsername())
 	}
 
 	ts, err := e.serv.GetTopoServer()
@@ -606,7 +565,7 @@ func (e *Executor) handleSetVitessMetadata(ctx context.Context, name, value stri
 		return nil, err
 	}
 
-	return &sqltypes.Result{RowsAffected: 1}, nil
+	return &sqltypes.Result{}, nil
 }
 
 func (e *Executor) handleShowVitessMetadata(ctx context.Context, opt *sqlparser.ShowTablesOpt) (*sqltypes.Result, error) {
@@ -635,30 +594,9 @@ func (e *Executor) handleShowVitessMetadata(ctx context.Context, opt *sqlparser.
 	}
 
 	return &sqltypes.Result{
-		Fields:       buildVarCharFields("Key", "Value"),
-		Rows:         rows,
-		RowsAffected: uint64(len(rows)),
+		Fields: buildVarCharFields("Key", "Value"),
+		Rows:   rows,
 	}, nil
-}
-
-func validateSetOnOff(v interface{}, typ string) (int64, error) {
-	var val int64
-	switch v := v.(type) {
-	case int64:
-		val = v
-	case string:
-		lcaseV := strings.ToLower(v)
-		if lcaseV == "on" {
-			val = 1
-		} else if lcaseV == "off" {
-			val = 0
-		} else {
-			return -1, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for %s: %s", typ, v)
-		}
-	default:
-		return -1, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value type for %s: %T", typ, v)
-	}
-	return val, nil
 }
 
 func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, dest key.Destination, destKeyspace string, destTabletType topodatapb.TabletType, logStats *LogStats) (*sqltypes.Result, error) {
@@ -666,36 +604,23 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 	if err != nil {
 		return nil, err
 	}
-	show, ok := stmt.(*sqlparser.Show)
+	showOuter, ok := stmt.(*sqlparser.Show)
 	if !ok {
 		// This code is unreachable.
-		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unrecognized SHOW statement: %v", sql)
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unrecognized SHOW statement: %v", sql)
 	}
+	show, ok := showOuter.Internal.(*sqlparser.ShowLegacy)
+	if !ok {
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] This should only be SHOW Legacy statement type: %v", sql)
+	}
+	ignoreMaxMemoryRows := sqlparser.IgnoreMaxMaxMemoryRowsDirective(stmt)
 	execStart := time.Now()
 	defer func() { logStats.ExecuteTime = time.Since(execStart) }()
 	switch strings.ToLower(show.Type) {
-	case sqlparser.KeywordString(sqlparser.COLLATION), sqlparser.KeywordString(sqlparser.VARIABLES):
-		if show.Scope == sqlparser.VitessMetadataStr {
+	case sqlparser.KeywordString(sqlparser.VARIABLES):
+		if show.Scope == sqlparser.VitessMetadataScope {
 			return e.handleShowVitessMetadata(ctx, show.ShowTablesOpt)
 		}
-
-		if destKeyspace == "" {
-			keyspaces, err := e.resolver.resolver.GetAllKeyspaces(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if len(keyspaces) == 0 {
-				return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "no keyspaces available")
-			}
-			return e.handleOther(ctx, safeSession, sql, bindVars, dest, keyspaces[0], destTabletType, logStats)
-		}
-	// for STATUS, return empty result set
-	case sqlparser.KeywordString(sqlparser.STATUS):
-		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Variable_name", "Value"),
-			Rows:         make([][]sqltypes.Value, 0, 2),
-			RowsAffected: 0,
-		}, nil
 	// for ENGINES, we want to return just InnoDB
 	case sqlparser.KeywordString(sqlparser.ENGINES):
 		rows := make([][]sqltypes.Value, 0, 6)
@@ -708,9 +633,8 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			"YES")
 		rows = append(rows, row)
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"),
-			Rows:         rows,
-			RowsAffected: 1,
+			Fields: buildVarCharFields("Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"),
+			Rows:   rows,
 		}, nil
 	// for PLUGINS, return InnoDb + mysql_native_password
 	case sqlparser.KeywordString(sqlparser.PLUGINS):
@@ -723,95 +647,40 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			"GPL")
 		rows = append(rows, row)
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Name", "Status", "Type", "Library", "License"),
-			Rows:         rows,
-			RowsAffected: 1,
+			Fields: buildVarCharFields("Name", "Status", "Type", "Library", "License"),
+			Rows:   rows,
 		}, nil
-	// CHARSET & CHARACTER SET return utf8mb4 & utf8
-	case sqlparser.KeywordString(sqlparser.CHARSET):
-		fields := buildVarCharFields("Charset", "Description", "Default collation")
-		maxLenField := &querypb.Field{Name: "Maxlen", Type: sqltypes.Int32}
-		fields = append(fields, maxLenField)
+	case sqlparser.KeywordString(sqlparser.VITESS_SHARDS):
+		showVitessShardsFilters := func(show *sqlparser.ShowLegacy) ([]func(string) bool, []func(string, *topodatapb.ShardReference) bool) {
+			keyspaceFilters := []func(string) bool{}
+			shardFilters := []func(string, *topodatapb.ShardReference) bool{}
 
-		charsets := []string{utf8, utf8mb4}
-		filter := show.ShowTablesOpt.Filter
-		rows, err := generateCharsetRows(filter, charsets)
-		if err != nil {
-			return nil, err
-		}
-		rowsAffected := uint64(len(rows))
+			if show.ShowTablesOpt == nil || show.ShowTablesOpt.Filter == nil {
+				return keyspaceFilters, shardFilters
+			}
 
-		return &sqltypes.Result{
-			Fields:       fields,
-			Rows:         rows,
-			RowsAffected: rowsAffected,
-		}, err
-	case "create table":
-		if !show.Table.Qualifier.IsEmpty() {
-			// Explicit keyspace was passed. Use that for targeting but remove from the query itself.
-			destKeyspace = show.Table.Qualifier.String()
-			show.Table.Qualifier = sqlparser.NewTableIdent("")
-		} else {
-			// No keyspace was indicated. Try to find one using the vschema.
-			tbl, err := e.VSchema().FindTable(destKeyspace, show.Table.Name.String())
-			if err != nil {
-				return nil, err
+			filter := show.ShowTablesOpt.Filter
+
+			if filter.Like != "" {
+				likeRexep := sqlparser.LikeToRegexp(filter.Like)
+
+				shardFilters = append(shardFilters, func(ks string, shard *topodatapb.ShardReference) bool {
+					return likeRexep.MatchString(topoproto.KeyspaceShardString(ks, shard.Name))
+				})
+
+				return keyspaceFilters, shardFilters
 			}
-			destKeyspace = tbl.Keyspace.Name
-		}
-		sql = sqlparser.String(show)
-	case sqlparser.KeywordString(sqlparser.COLUMNS):
-		if !show.OnTable.Qualifier.IsEmpty() {
-			destKeyspace = show.OnTable.Qualifier.String()
-			show.OnTable.Qualifier = sqlparser.NewTableIdent("")
-		} else if show.ShowTablesOpt != nil {
-			if show.ShowTablesOpt.DbName != "" {
-				destKeyspace = show.ShowTablesOpt.DbName
-				show.ShowTablesOpt.DbName = ""
+
+			if filter.Filter != nil {
+				// TODO build a query planner I guess? lol that should be fun
+				log.Infof("SHOW VITESS_SHARDS where clause %+v. Ignoring this (for now).", filter.Filter)
 			}
-		} else {
-			break
-		}
-		sql = sqlparser.String(show)
-	case sqlparser.KeywordString(sqlparser.INDEX), sqlparser.KeywordString(sqlparser.KEYS), sqlparser.KeywordString(sqlparser.INDEXES):
-		if !show.OnTable.Qualifier.IsEmpty() {
-			destKeyspace = show.OnTable.Qualifier.String()
-			show.OnTable.Qualifier = sqlparser.NewTableIdent("")
-		} else if show.ShowTablesOpt != nil {
-			if show.ShowTablesOpt.DbName != "" {
-				destKeyspace = show.ShowTablesOpt.DbName
-				show.ShowTablesOpt.DbName = ""
-			}
-		} else {
-			break
-		}
-		sql = sqlparser.String(show)
-	case sqlparser.KeywordString(sqlparser.TABLES):
-		if show.ShowTablesOpt != nil && show.ShowTablesOpt.DbName != "" {
-			if destKeyspace == "" {
-				// Change "show tables from <keyspace>" to "show tables" directed to that keyspace.
-				destKeyspace = show.ShowTablesOpt.DbName
-			}
-			show.ShowTablesOpt.DbName = ""
-		}
-		sql = sqlparser.String(show)
-	case sqlparser.KeywordString(sqlparser.DATABASES), "vitess_keyspaces", "keyspaces":
-		keyspaces, err := e.resolver.resolver.GetAllKeyspaces(ctx)
-		if err != nil {
-			return nil, err
+
+			return keyspaceFilters, shardFilters
 		}
 
-		rows := make([][]sqltypes.Value, len(keyspaces))
-		for i, v := range keyspaces {
-			rows[i] = buildVarCharRow(v)
-		}
+		keyspaceFilters, shardFilters := showVitessShardsFilters(show)
 
-		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Databases"),
-			Rows:         rows,
-			RowsAffected: uint64(len(rows)),
-		}, nil
-	case "vitess_shards":
 		keyspaces, err := e.resolver.resolver.GetAllKeyspaces(ctx)
 		if err != nil {
 			return nil, err
@@ -819,6 +688,18 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 
 		var rows [][]sqltypes.Value
 		for _, keyspace := range keyspaces {
+			skipKeyspace := false
+			for _, filter := range keyspaceFilters {
+				if !filter(keyspace) {
+					skipKeyspace = true
+					break
+				}
+			}
+
+			if skipKeyspace {
+				continue
+			}
+
 			_, _, shards, err := e.resolver.resolver.GetKeyspaceShards(ctx, keyspace, destTabletType)
 			if err != nil {
 				// There might be a misconfigured keyspace or no shards in the keyspace.
@@ -827,24 +708,34 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			}
 
 			for _, shard := range shards {
+				skipShard := false
+				for _, filter := range shardFilters {
+					if !filter(keyspace, shard) {
+						skipShard = true
+						break
+					}
+				}
+
+				if skipShard {
+					continue
+				}
+
 				rows = append(rows, buildVarCharRow(topoproto.KeyspaceShardString(keyspace, shard.Name)))
 			}
 		}
 
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Shards"),
-			Rows:         rows,
-			RowsAffected: uint64(len(rows)),
+			Fields: buildVarCharFields("Shards"),
+			Rows:   rows,
 		}, nil
-	case "vitess_tablets":
-		return e.showTablets()
+	case sqlparser.KeywordString(sqlparser.VITESS_TABLETS):
+		return e.showTablets(show)
 	case "vitess_target":
 		var rows [][]sqltypes.Value
 		rows = append(rows, buildVarCharRow(safeSession.TargetString))
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Target"),
-			Rows:         rows,
-			RowsAffected: uint64(len(rows)),
+			Fields: buildVarCharFields("Target"),
+			Rows:   rows,
 		}, nil
 	case "vschema tables":
 		if destKeyspace == "" {
@@ -852,7 +743,7 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 		}
 		ks, ok := e.VSchema().Keyspaces[destKeyspace]
 		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "keyspace %s not found in vschema", destKeyspace)
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", destKeyspace)
 		}
 
 		var tables []string
@@ -867,9 +758,8 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 		}
 
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Tables"),
-			Rows:         rows,
-			RowsAffected: uint64(len(rows)),
+			Fields: buildVarCharFields("Tables"),
+			Rows:   rows,
 		}, nil
 	case "vschema vindexes":
 		vschema := e.vm.GetCurrentSrvVschema()
@@ -897,7 +787,7 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			tableName := show.OnTable.Name.String()
 			table, ok := ks.Tables[tableName]
 			if !ok {
-				return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "table `%s` does not exist in keyspace `%s`", tableName, ksName)
+				return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.NoSuchTable, "table '%s' does not exist in keyspace '%s'", tableName, ksName)
 			}
 
 			for _, colVindex := range table.ColumnVindexes {
@@ -919,9 +809,8 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			}
 
 			return &sqltypes.Result{
-				Fields:       buildVarCharFields("Columns", "Name", "Type", "Params", "Owner"),
-				Rows:         rows,
-				RowsAffected: uint64(len(rows)),
+				Fields: buildVarCharFields("Columns", "Name", "Type", "Params", "Owner"),
+				Rows:   rows,
 			}, nil
 		}
 
@@ -952,14 +841,13 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 			}
 		}
 		return &sqltypes.Result{
-			Fields:       buildVarCharFields("Keyspace", "Name", "Type", "Params", "Owner"),
-			Rows:         rows,
-			RowsAffected: uint64(len(rows)),
+			Fields: buildVarCharFields("Keyspace", "Name", "Type", "Params", "Owner"),
+			Rows:   rows,
 		}, nil
 	case sqlparser.KeywordString(sqlparser.WARNINGS):
 		fields := []*querypb.Field{
 			{Name: "Level", Type: sqltypes.VarChar},
-			{Name: "Type", Type: sqltypes.Uint16},
+			{Name: "Code", Type: sqltypes.Uint16},
 			{Name: "Message", Type: sqltypes.VarChar},
 		}
 		rows := make([][]sqltypes.Value, 0)
@@ -981,11 +869,42 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 	}
 
 	// Any other show statement is passed through
-	return e.handleOther(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
+	return e.handleOther(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats, ignoreMaxMemoryRows)
 }
 
-func (e *Executor) showTablets() (*sqltypes.Result, error) {
-	var rows [][]sqltypes.Value
+// (tablet, servingState, mtst) -> bool
+type tabletFilter func(*topodatapb.Tablet, string, int64) bool
+
+func (e *Executor) showTablets(show *sqlparser.ShowLegacy) (*sqltypes.Result, error) {
+	getTabletFilters := func(show *sqlparser.ShowLegacy) []tabletFilter {
+		filters := []tabletFilter{}
+
+		if show.ShowTablesOpt == nil || show.ShowTablesOpt.Filter == nil {
+			return filters
+		}
+
+		filter := show.ShowTablesOpt.Filter
+		if filter.Like != "" {
+			tabletRegexp := sqlparser.LikeToRegexp(filter.Like)
+
+			f := func(tablet *topodatapb.Tablet, servingState string, masterTermStartTime int64) bool {
+				return tabletRegexp.MatchString(tablet.Hostname)
+			}
+
+			filters = append(filters, f)
+			return filters
+		}
+
+		if filter.Filter != nil {
+			log.Infof("SHOW VITESS_TABLETS where clause: %+v. Ignoring this (for now).", filter.Filter)
+		}
+
+		return filters
+	}
+
+	tabletFilters := getTabletFilters(show)
+
+	rows := [][]sqltypes.Value{}
 	if UsingLegacyGateway() {
 		status := e.scatterConn.GetLegacyHealthCheckCacheStatus()
 		for _, s := range status {
@@ -1000,6 +919,19 @@ func (e *Executor) showTablets() (*sqltypes.Result, error) {
 					// this code depends on the fact that TabletExternallyReparentedTimestamp is the seconds since epoch start
 					mtstStr = time.Unix(mtst, 0).UTC().Format(time.RFC3339)
 				}
+
+				skipTablet := false
+				for _, filter := range tabletFilters {
+					if !filter(ts.Tablet, state, mtst) {
+						skipTablet = true
+						break
+					}
+				}
+
+				if skipTablet {
+					continue
+				}
+
 				rows = append(rows, buildVarCharRow(
 					s.Cell,
 					s.Target.Keyspace,
@@ -1026,6 +958,19 @@ func (e *Executor) showTablets() (*sqltypes.Result, error) {
 					// this code depends on the fact that MasterTermStartTime is the seconds since epoch start
 					mtstStr = time.Unix(mtst, 0).UTC().Format(time.RFC3339)
 				}
+
+				skipTablet := false
+				for _, filter := range tabletFilters {
+					if !filter(ts.Tablet, state, mtst) {
+						skipTablet = true
+						break
+					}
+				}
+
+				if skipTablet {
+					continue
+				}
+
 				rows = append(rows, buildVarCharRow(
 					s.Cell,
 					s.Target.Keyspace,
@@ -1040,13 +985,12 @@ func (e *Executor) showTablets() (*sqltypes.Result, error) {
 		}
 	}
 	return &sqltypes.Result{
-		Fields:       buildVarCharFields("Cell", "Keyspace", "Shard", "TabletType", "State", "Alias", "Hostname", "MasterTermStartTime"),
-		Rows:         rows,
-		RowsAffected: uint64(len(rows)),
+		Fields: buildVarCharFields("Cell", "Keyspace", "Shard", "TabletType", "State", "Alias", "Hostname", "MasterTermStartTime"),
+		Rows:   rows,
 	}, nil
 }
 
-func (e *Executor) handleOther(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, dest key.Destination, destKeyspace string, destTabletType topodatapb.TabletType, logStats *LogStats) (*sqltypes.Result, error) {
+func (e *Executor) handleOther(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, dest key.Destination, destKeyspace string, destTabletType topodatapb.TabletType, logStats *LogStats, ignoreMaxMemoryRows bool) (*sqltypes.Result, error) {
 	if destKeyspace == "" {
 		return nil, errNoKeyspace
 	}
@@ -1077,8 +1021,9 @@ func (e *Executor) handleOther(ctx context.Context, safeSession *SafeSession, sq
 	default:
 		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Destination can only be a single shard for statement: %s, got: %v", sql, dest)
 	}
+
 	execStart := time.Now()
-	result, err := e.destinationExec(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
+	result, err := e.destinationExec(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats, ignoreMaxMemoryRows)
 
 	e.updateQueryCounts("Other", "", "", int64(logStats.ShardQueries))
 
@@ -1097,24 +1042,23 @@ func (e *Executor) StreamExecute(ctx context.Context, method string, safeSession
 		bindVars = make(map[string]*querypb.BindVariable)
 	}
 	query, comments := sqlparser.SplitMarginComments(sql)
-	vcursor, _ := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver)
-
+	vcursor, _ := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver, e.serv, e.warnShardedOnly)
+	vcursor.SetIgnoreMaxMemoryRows(true)
 	switch stmtType {
 	case sqlparser.StmtStream:
 		// this is a stream statement for messaging
 		// TODO: support keyRange syntax
 		return e.handleMessageStream(ctx, sql, target, callback, vcursor, logStats)
 	case sqlparser.StmtSelect, sqlparser.StmtDDL, sqlparser.StmtSet, sqlparser.StmtInsert, sqlparser.StmtReplace, sqlparser.StmtUpdate, sqlparser.StmtDelete,
-		sqlparser.StmtUse, sqlparser.StmtOther, sqlparser.StmtComment:
+		sqlparser.StmtUse, sqlparser.StmtOther, sqlparser.StmtComment, sqlparser.StmtFlush:
 		// These may or may not all work, but getPlan() should either return a plan with instructions
 		// or an error, so it's safe to try.
 		break
-	case sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtRollback:
-		// These statements don't populate plan.Instructions. We want to make sure we don't try to
-		// dereference nil Instructions which would panic.
-		fallthrough
+	case sqlparser.StmtVStream:
+		log.Infof("handleVStream called with target %v", target)
+		return e.handleVStream(ctx, sql, target, callback, vcursor, logStats)
 	default:
-		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported statement type for OLAP: %s", stmtType)
+		return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "OLAP does not supported statement type: %s", stmtType)
 	}
 
 	plan, err := e.getPlan(
@@ -1135,6 +1079,11 @@ func (e *Executor) StreamExecute(ctx context.Context, method string, safeSession
 		return err
 	}
 
+	// add any warnings that the planner wants to add
+	for _, warning := range plan.Warnings {
+		safeSession.RecordWarning(warning)
+	}
+
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 
@@ -1144,6 +1093,8 @@ func (e *Executor) StreamExecute(ctx context.Context, method string, safeSession
 	// dictated by stream_buffer_size.
 	result := &sqltypes.Result{}
 	byteCount := 0
+	seenResults := false
+	var foundRows uint64
 	err = plan.Instructions.StreamExecute(vcursor, bindVars, true, func(qr *sqltypes.Result) error {
 		// If the row has field info, send it separately.
 		// TODO(sougou): this behavior is for handling tests because
@@ -1153,16 +1104,20 @@ func (e *Executor) StreamExecute(ctx context.Context, method string, safeSession
 			if err := callback(qrfield); err != nil {
 				return err
 			}
+			seenResults = true
 		}
 
+		foundRows += uint64(len(qr.Rows))
 		for _, row := range qr.Rows {
 			result.Rows = append(result.Rows, row)
+
 			for _, col := range row {
 				byteCount += col.Len()
 			}
 
 			if byteCount >= e.streamSize {
 				err := callback(result)
+				seenResults = true
 				result = &sqltypes.Result{}
 				byteCount = 0
 				if err != nil {
@@ -1173,11 +1128,18 @@ func (e *Executor) StreamExecute(ctx context.Context, method string, safeSession
 		return nil
 	})
 
-	// Send left-over rows.
-	if len(result.Rows) > 0 {
-		if err := callback(result); err != nil {
-			return err
+	// Send left-over rows if there is no error on execution.
+	if err == nil {
+		if len(result.Rows) > 0 || !seenResults {
+			if err := callback(result); err != nil {
+				return err
+			}
 		}
+		// save session stats for future queries
+		if !safeSession.foundRowsHandled {
+			safeSession.FoundRows = foundRows
+		}
+		safeSession.RowCount = -1
 	}
 
 	logStats.ExecuteTime = time.Since(execStart)
@@ -1197,7 +1159,7 @@ func (e *Executor) handleMessageStream(ctx context.Context, sql string, target q
 	streamStmt, ok := stmt.(*sqlparser.Stream)
 	if !ok {
 		logStats.Error = err
-		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unrecognized STREAM statement: %v", sql)
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unrecognized STREAM statement: %v", sql)
 	}
 
 	// TODO: Add support for destination target in streamed queries
@@ -1274,26 +1236,24 @@ func (e *Executor) getPlan(vcursor *vcursorImpl, sql string, comments sqlparser.
 	if e.VSchema() == nil {
 		return nil, errors.New("vschema not initialized")
 	}
-	planKey := vcursor.planPrefixKey() + ":" + sql
-	if plan, ok := e.plans.Get(planKey); ok {
-		return plan.(*engine.Plan), nil
-	}
-	stmt, err := sqlparser.Parse(sql)
+
+	stmt, reservedVars, err := sqlparser.Parse2(sql)
 	if err != nil {
 		return nil, err
 	}
-
 	query := sql
 	statement := stmt
-	bindVarNeeds := sqlparser.BindVarNeeds{}
+	bindVarNeeds := &sqlparser.BindVarNeeds{}
 	if !sqlparser.IgnoreMaxPayloadSizeDirective(statement) && !isValidPayloadSize(query) {
-		return nil, vterrors.New(vtrpcpb.Code_RESOURCE_EXHAUSTED, "query payload size above threshold")
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_RESOURCE_EXHAUSTED, vterrors.NetPacketTooLarge, "query payload size above threshold")
 	}
+	ignoreMaxMemoryRows := sqlparser.IgnoreMaxMaxMemoryRowsDirective(stmt)
+	vcursor.SetIgnoreMaxMemoryRows(ignoreMaxMemoryRows)
 
 	// Normalize if possible and retry.
-	if (e.normalize && sqlparser.CanNormalize(stmt)) || sqlparser.IsSetStatement(stmt) {
+	if (e.normalize && sqlparser.CanNormalize(stmt)) || sqlparser.MustRewriteAST(stmt) {
 		parameterize := e.normalize // the public flag is called normalize
-		result, err := sqlparser.PrepareAST(stmt, bindVars, "vtg", parameterize)
+		result, err := sqlparser.PrepareAST(stmt, reservedVars, bindVars, "vtg", parameterize, vcursor.keyspace)
 		if err != nil {
 			return nil, err
 		}
@@ -1307,15 +1267,20 @@ func (e *Executor) getPlan(vcursor *vcursorImpl, sql string, comments sqlparser.
 		logStats.BindVariables = bindVars
 	}
 
-	planKey = vcursor.planPrefixKey() + ":" + query
+	planKey := vcursor.planPrefixKey() + ":" + query
 	if plan, ok := e.plans.Get(planKey); ok {
 		return plan.(*engine.Plan), nil
 	}
-	plan, err := planbuilder.BuildFromStmt(query, statement, vcursor, bindVarNeeds)
+
+	plan, err := planbuilder.BuildFromStmt(query, statement, reservedVars, vcursor, bindVarNeeds)
 	if err != nil {
 		return nil, err
 	}
-	if !skipQueryPlanCache && !sqlparser.SkipQueryPlanCacheDirective(statement) && plan.Instructions != nil {
+
+	plan.Warnings = vcursor.warnings
+	vcursor.warnings = nil
+
+	if !skipQueryPlanCache && !sqlparser.SkipQueryPlanCacheDirective(statement) && sqlparser.CachePlan(statement) {
 		e.plans.Set(planKey, plan)
 	}
 	return plan, nil
@@ -1326,7 +1291,24 @@ func skipQueryPlanCache(safeSession *SafeSession) bool {
 	if safeSession == nil || safeSession.Options == nil {
 		return false
 	}
-	return safeSession.Options.SkipQueryPlanCache
+	return safeSession.Options.SkipQueryPlanCache || safeSession.Options.HasCreatedTempTables
+}
+
+type cacheItem struct {
+	Key   string
+	Value *engine.Plan
+}
+
+func (e *Executor) debugCacheEntries() (items []cacheItem) {
+	e.plans.ForEach(func(value interface{}) bool {
+		plan := value.(*engine.Plan)
+		items = append(items, cacheItem{
+			Key:   plan.Original,
+			Value: plan,
+		})
+		return true
+	})
+	return
 }
 
 // ServeHTTP shows the current plans in the query cache.
@@ -1338,7 +1320,7 @@ func (e *Executor) ServeHTTP(response http.ResponseWriter, request *http.Request
 
 	switch request.URL.Path {
 	case pathQueryPlans:
-		returnAsJSON(response, e.plans.Items())
+		returnAsJSON(response, e.debugCacheEntries())
 	case pathVSchema:
 		returnAsJSON(response, e.VSchema())
 	case pathScatterStats:
@@ -1361,7 +1343,7 @@ func returnAsJSON(response http.ResponseWriter, stuff interface{}) {
 }
 
 // Plans returns the LRU plan cache
-func (e *Executor) Plans() *cache.LRUCache {
+func (e *Executor) Plans() cache.Cache {
 	return e.plans
 }
 
@@ -1424,30 +1406,30 @@ func generateCharsetRows(showFilter *sqlparser.ShowFilter, colNames []string) ([
 	} else {
 		cmpExp, ok := showFilter.Filter.(*sqlparser.ComparisonExpr)
 		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "expect a 'LIKE' or '=' expression")
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "expect a 'LIKE' or '=' expression")
 		}
 
 		left, ok := cmpExp.Left.(*sqlparser.ColName)
 		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "expect left side to be 'charset'")
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "expect left side to be 'column'")
 		}
 		leftOk := left.Name.EqualString(charset)
 
 		if leftOk {
-			sqlVal, ok := cmpExp.Right.(*sqlparser.SQLVal)
+			literal, ok := cmpExp.Right.(*sqlparser.Literal)
 			if !ok {
-				return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "we expect the right side to be a string")
+				return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "expect right side to be string")
 			}
-			rightString := string(sqlVal.Val)
+			rightString := string(literal.Val)
 
 			switch cmpExp.Operator {
-			case sqlparser.EqualStr:
+			case sqlparser.EqualOp:
 				for _, colName := range colNames {
 					if rightString == colName {
 						filteredColName = colName
 					}
 				}
-			case sqlparser.LikeStr:
+			case sqlparser.LikeOp:
 				filteredColName, err = checkLikeOpt(rightString, colNames)
 				if err != nil {
 					return nil, err
@@ -1543,7 +1525,7 @@ func (e *Executor) prepare(ctx context.Context, safeSession *SafeSession, sql st
 	}
 
 	if UsingLegacyGateway() && safeSession.InTransaction() && destTabletType != topodatapb.TabletType_MASTER {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Executor.prepare: transactions are supported only for master tablet types, current type: %v", destTabletType)
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "transaction is supported only for master tablet type, current type: %v", destTabletType)
 	}
 	if bindVars == nil {
 		bindVars = make(map[string]*querypb.BindVariable)
@@ -1567,7 +1549,7 @@ func (e *Executor) prepare(ctx context.Context, safeSession *SafeSession, sql st
 	case sqlparser.StmtSelect:
 		return e.handlePrepare(ctx, safeSession, sql, bindVars, logStats)
 	case sqlparser.StmtDDL, sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtRollback, sqlparser.StmtSet, sqlparser.StmtInsert, sqlparser.StmtReplace, sqlparser.StmtUpdate, sqlparser.StmtDelete,
-		sqlparser.StmtUse, sqlparser.StmtOther, sqlparser.StmtComment, sqlparser.StmtExplain:
+		sqlparser.StmtUse, sqlparser.StmtOther, sqlparser.StmtComment, sqlparser.StmtExplain, sqlparser.StmtFlush:
 		return nil, nil
 	case sqlparser.StmtShow:
 		res, err := e.handleShow(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
@@ -1576,13 +1558,13 @@ func (e *Executor) prepare(ctx context.Context, safeSession *SafeSession, sql st
 		}
 		return res.Fields, nil
 	}
-	return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unrecognized statement: %s", sql)
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unrecognized prepare statement: %s", sql)
 }
 
 func (e *Executor) handlePrepare(ctx context.Context, safeSession *SafeSession, sql string, bindVars map[string]*querypb.BindVariable, logStats *LogStats) ([]*querypb.Field, error) {
 	// V3 mode.
 	query, comments := sqlparser.SplitMarginComments(sql)
-	vcursor, _ := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver)
+	vcursor, _ := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver, e.serv, e.warnShardedOnly)
 	plan, err := e.getPlan(
 		vcursor,
 		query,
@@ -1599,27 +1581,38 @@ func (e *Executor) handlePrepare(ctx context.Context, safeSession *SafeSession, 
 		return nil, err
 	}
 
+	err = e.addNeededBindVars(plan.BindVarNeeds, bindVars, safeSession)
+	if err != nil {
+		logStats.Error = err
+		return nil, err
+	}
+
 	qr, err := plan.Instructions.GetFields(vcursor, bindVars)
 	logStats.ExecuteTime = time.Since(execStart)
 	var errCount uint64
 	if err != nil {
 		logStats.Error = err
-		errCount = 1
+		errCount = 1 //nolint
 		return nil, err
 	}
 	logStats.RowsAffected = qr.RowsAffected
 
-	plan.AddStats(1, time.Since(logStats.StartTime), uint64(logStats.ShardQueries), logStats.RowsAffected, errCount)
+	plan.AddStats(1, time.Since(logStats.StartTime), logStats.ShardQueries, qr.RowsAffected, uint64(len(qr.Rows)), errCount)
 
 	return qr.Fields, err
 }
 
 // ExecuteMultiShard implements the IExecutor interface
-func (e *Executor) ExecuteMultiShard(ctx context.Context, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, session *SafeSession, notInTransaction bool, autocommit bool) (qr *sqltypes.Result, errs []error) {
-	return e.scatterConn.ExecuteMultiShard(ctx, rss, queries, session, notInTransaction, autocommit)
+func (e *Executor) ExecuteMultiShard(ctx context.Context, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, session *SafeSession, autocommit bool, ignoreMaxMemoryRows bool) (qr *sqltypes.Result, errs []error) {
+	return e.scatterConn.ExecuteMultiShard(ctx, rss, queries, session, autocommit, ignoreMaxMemoryRows)
 }
 
 // StreamExecuteMulti implements the IExecutor interface
 func (e *Executor) StreamExecuteMulti(ctx context.Context, query string, rss []*srvtopo.ResolvedShard, vars []map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
 	return e.scatterConn.StreamExecuteMulti(ctx, query, rss, vars, options, callback)
+}
+
+//ExecuteLock implments the IExecutor interface
+func (e *Executor) ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, session *SafeSession) (*sqltypes.Result, error) {
+	return e.scatterConn.ExecuteLock(ctx, rs, query, session)
 }

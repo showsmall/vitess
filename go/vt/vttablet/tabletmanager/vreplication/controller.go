@@ -20,13 +20,15 @@ import (
 	"flag"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/vterrors"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/tb"
@@ -40,10 +42,11 @@ import (
 )
 
 var (
-	healthcheckTopologyRefresh = flag.Duration("vreplication_healthcheck_topology_refresh", 30*time.Second, "refresh interval for re-reading the topology")
-	healthcheckRetryDelay      = flag.Duration("vreplication_healthcheck_retry_delay", 5*time.Second, "healthcheck retry delay")
-	healthcheckTimeout         = flag.Duration("vreplication_healthcheck_timeout", 1*time.Minute, "healthcheck retry delay")
-	retryDelay                 = flag.Duration("vreplication_retry_delay", 5*time.Second, "delay before retrying a failed binlog connection")
+	// deprecated flags (7.0)
+	_          = flag.Duration("vreplication_healthcheck_topology_refresh", 30*time.Second, "refresh interval for re-reading the topology")
+	_          = flag.Duration("vreplication_healthcheck_retry_delay", 5*time.Second, "healthcheck retry delay")
+	_          = flag.Duration("vreplication_healthcheck_timeout", 1*time.Minute, "healthcheck retry delay")
+	retryDelay = flag.Duration("vreplication_retry_delay", 5*time.Second, "delay before retrying a failed binlog connection")
 )
 
 // controller is created by Engine. Members are initialized upfront.
@@ -81,6 +84,7 @@ func newController(ctx context.Context, params map[string]string, dbClientFactor
 		blpStats:        blpStats,
 		done:            make(chan struct{}),
 	}
+	log.Infof("creating controller with cell: %v, tabletTypes: %v, and params: %v", cell, tabletTypesStr, params)
 
 	// id
 	id, err := strconv.Atoi(params["id"])
@@ -112,7 +116,17 @@ func newController(ctx context.Context, params map[string]string, dbClientFactor
 		if v := params["tablet_types"]; v != "" {
 			tabletTypesStr = v
 		}
-		tp, err := discovery.NewTabletPicker(ctx, ts, cell, ct.source.Keyspace, ct.source.Shard, tabletTypesStr, *healthcheckTopologyRefresh, *healthcheckRetryDelay, *healthcheckTimeout)
+		log.Infof("creating tablet picker for source keyspace/shard %v/%v with cell: %v and tabletTypes: %v", ct.source.Keyspace, ct.source.Shard, cell, tabletTypesStr)
+		cells := strings.Split(cell, ",")
+
+		sourceTopo := ts
+		if ct.source.ExternalCluster != "" {
+			sourceTopo, err = sourceTopo.OpenExternalVitessClusterServer(ctx, ct.source.ExternalCluster)
+			if err != nil {
+				return nil, err
+			}
+		}
+		tp, err := discovery.NewTabletPicker(sourceTopo, cells, ct.source.Keyspace, ct.source.Shard, tabletTypesStr)
 		if err != nil {
 			return nil, err
 		}
@@ -130,9 +144,6 @@ func newController(ctx context.Context, params map[string]string, dbClientFactor
 func (ct *controller) run(ctx context.Context) {
 	defer func() {
 		log.Infof("stream %v: stopped", ct.id)
-		if ct.tabletPicker != nil {
-			ct.tabletPicker.Close()
-		}
 		close(ct.done)
 	}()
 
@@ -144,13 +155,16 @@ func (ct *controller) run(ctx context.Context) {
 		// Sometimes, canceled contexts get wrapped as errors.
 		select {
 		case <-ctx.Done():
+			log.Warningf("context canceled: %s", err.Error())
 			return
 		default:
 		}
 		log.Errorf("stream %v: %v, retrying after %v", ct.id, err, *retryDelay)
+		ct.blpStats.ErrorCounts.Add([]string{"Stream Error"}, 1)
 		timer := time.NewTimer(*retryDelay)
 		select {
 		case <-ctx.Done():
+			log.Warningf("context canceled: %s", err.Error())
 			timer.Stop()
 			return
 		case <-timer.C:
@@ -190,17 +204,24 @@ func (ct *controller) runBlp(ctx context.Context) (err error) {
 		log.Infof("trying to find a tablet eligible for vreplication. stream id: %v", ct.id)
 		tablet, err = ct.tabletPicker.PickForStreaming(ctx)
 		if err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				ct.blpStats.ErrorCounts.Add([]string{"No Source Tablet Found"}, 1)
+				ct.setMessage(dbClient, fmt.Sprintf("Error picking tablet: %s", err.Error()))
+			}
 			return err
 		}
+		ct.setMessage(dbClient, fmt.Sprintf("Picked source tablet: %s", tablet.Alias.String()))
 		log.Infof("found a tablet eligible for vreplication. stream id: %v  tablet: %s", ct.id, tablet.Alias.String())
 		ct.sourceTablet.Set(tablet.Alias.String())
 	}
-
 	switch {
 	case len(ct.source.Tables) > 0:
 		// Table names can have search patterns. Resolve them against the schema.
 		tables, err := mysqlctl.ResolveTables(ctx, ct.mysqld, dbClient.DBName(), ct.source.Tables)
 		if err != nil {
+			ct.blpStats.ErrorCounts.Add([]string{"Invalid Source"}, 1)
 			return vterrors.Wrap(err, "failed to resolve table names")
 		}
 
@@ -237,11 +258,24 @@ func (ct *controller) runBlp(ctx context.Context) (err error) {
 		defer vsClient.Close(ctx)
 
 		vr := newVReplicator(ct.id, &ct.source, vsClient, ct.blpStats, dbClient, ct.mysqld, ct.vre)
+
 		return vr.Replicate(ctx)
 	}
+	ct.blpStats.ErrorCounts.Add([]string{"Invalid Source"}, 1)
 	return fmt.Errorf("missing source")
 }
 
+func (ct *controller) setMessage(dbClient binlogplayer.DBClient, message string) error {
+	ct.blpStats.History.Add(&binlogplayer.StatsHistoryRecord{
+		Time:    time.Now(),
+		Message: message,
+	})
+	query := fmt.Sprintf("update _vt.vreplication set message=%v where id=%v", encodeString(binlogplayer.MessageTruncate(message)), ct.id)
+	if _, err := dbClient.ExecuteFetch(query, 1); err != nil {
+		return fmt.Errorf("could not set message: %v: %v", query, err)
+	}
+	return nil
+}
 func (ct *controller) Stop() {
 	ct.cancel()
 	<-ct.done

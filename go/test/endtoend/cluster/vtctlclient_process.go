@@ -21,6 +21,8 @@ import (
 	"os/exec"
 	"strings"
 
+	"vitess.io/vitess/go/vt/vterrors"
+
 	"vitess.io/vitess/go/vt/log"
 )
 
@@ -36,19 +38,35 @@ type VtctlClientProcess struct {
 
 // InitShardMaster executes vtctlclient command to make one of tablet as master
 func (vtctlclient *VtctlClientProcess) InitShardMaster(Keyspace string, Shard string, Cell string, TabletUID int) (err error) {
-	return vtctlclient.ExecuteCommand(
+	output, err := vtctlclient.ExecuteCommandWithOutput(
 		"InitShardMaster",
-		"-force",
+		"-force", "-wait_replicas_timeout", "31s",
 		fmt.Sprintf("%s/%s", Keyspace, Shard),
 		fmt.Sprintf("%s-%d", Cell, TabletUID))
+	if err != nil {
+		log.Errorf("error in InitShardMaster output %s, err %s", output, err.Error())
+	}
+	return err
+}
+
+// ApplySchemaWithOutput applies SQL schema to the keyspace
+func (vtctlclient *VtctlClientProcess) ApplySchemaWithOutput(Keyspace string, SQL string, ddlStrategy string) (result string, err error) {
+	args := []string{
+		"ApplySchema",
+		"-sql", SQL,
+	}
+	if ddlStrategy != "" {
+		args = append(args, "-ddl_strategy", ddlStrategy)
+	}
+	args = append(args, Keyspace)
+	return vtctlclient.ExecuteCommandWithOutput(args...)
 }
 
 // ApplySchema applies SQL schema to the keyspace
-func (vtctlclient *VtctlClientProcess) ApplySchema(Keyspace string, SQL string) (err error) {
-	return vtctlclient.ExecuteCommand(
-		"ApplySchema",
-		"-sql", SQL,
-		Keyspace)
+func (vtctlclient *VtctlClientProcess) ApplySchema(Keyspace string, SQL string) error {
+	message, err := vtctlclient.ApplySchemaWithOutput(Keyspace, SQL, "direct")
+
+	return vterrors.Wrap(err, message)
 }
 
 // ApplyVSchema applies vitess schema (JSON format) to the keyspace
@@ -60,20 +78,80 @@ func (vtctlclient *VtctlClientProcess) ApplyVSchema(Keyspace string, JSON string
 	)
 }
 
+// ApplyRoutingRules does it
+func (vtctlclient *VtctlClientProcess) ApplyRoutingRules(JSON string) (err error) {
+	return vtctlclient.ExecuteCommand("ApplyRoutingRules", "-rules", JSON)
+}
+
+// OnlineDDLShowRecent responds with recent schema migration list
+func (vtctlclient *VtctlClientProcess) OnlineDDLShowRecent(Keyspace string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"OnlineDDL",
+		Keyspace,
+		"show",
+		"recent",
+	)
+}
+
+// OnlineDDLCancelMigration cancels a given migration uuid
+func (vtctlclient *VtctlClientProcess) OnlineDDLCancelMigration(Keyspace, uuid string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"OnlineDDL",
+		Keyspace,
+		"cancel",
+		uuid,
+	)
+}
+
+// OnlineDDLCancelAllMigrations cancels all migrations for a keyspace
+func (vtctlclient *VtctlClientProcess) OnlineDDLCancelAllMigrations(Keyspace string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"OnlineDDL",
+		Keyspace,
+		"cancel-all",
+	)
+}
+
+// OnlineDDLRetryMigration retries a given migration uuid
+func (vtctlclient *VtctlClientProcess) OnlineDDLRetryMigration(Keyspace, uuid string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"OnlineDDL",
+		Keyspace,
+		"retry",
+		uuid,
+	)
+}
+
+// OnlineDDLRevertMigration reverts a given migration uuid
+func (vtctlclient *VtctlClientProcess) OnlineDDLRevertMigration(Keyspace, uuid string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"OnlineDDL",
+		Keyspace,
+		"revert",
+		uuid,
+	)
+}
+
+// VExec runs a VExec query
+func (vtctlclient *VtctlClientProcess) VExec(Keyspace, workflow, query string) (result string, err error) {
+	return vtctlclient.ExecuteCommandWithOutput(
+		"VExec",
+		fmt.Sprintf("%s.%s", Keyspace, workflow),
+		query,
+	)
+}
+
 // ExecuteCommand executes any vtctlclient command
 func (vtctlclient *VtctlClientProcess) ExecuteCommand(args ...string) (err error) {
-	pArgs := []string{"-server", vtctlclient.Server}
-
-	if *isCoverage {
-		pArgs = append(pArgs, "-test.coverprofile="+getCoveragePath("vtctlclient-"+args[0]+".out"), "-test.v")
+	output, err := vtctlclient.ExecuteCommandWithOutput(args...)
+	if output != "" {
+		if err != nil {
+			log.Errorf("Output:\n%v", output)
+		} else {
+			log.Infof("Output:\n%v", output)
+		}
 	}
-	pArgs = append(pArgs, args...)
-	tmpProcess := exec.Command(
-		vtctlclient.Binary,
-		pArgs...,
-	)
-	log.Infof("Executing vtctlclient with command: %v", strings.Join(tmpProcess.Args, " "))
-	return tmpProcess.Run()
+	return err
 }
 
 // ExecuteCommandWithOutput executes any vtctlclient command and returns output

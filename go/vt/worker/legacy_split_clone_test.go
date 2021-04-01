@@ -26,7 +26,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
+
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
@@ -149,7 +151,7 @@ func (tc *legacySplitCloneTestCase) setUp(v3 bool) {
 	if err := tc.wi.wr.SetKeyspaceShardingInfo(ctx, "ks", "keyspace_id", topodatapb.KeyspaceIdType_UINT64, false); err != nil {
 		tc.t.Fatalf("SetKeyspaceShardingInfo failed: %v", err)
 	}
-	if err := tc.wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil); err != nil {
+	if err := tc.wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil, false); err != nil {
 		tc.t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
@@ -179,7 +181,8 @@ func (tc *legacySplitCloneTestCase) setUp(v3 bool) {
 		qs := fakes.NewStreamHealthQueryService(sourceRdonly.Target())
 		qs.AddDefaultHealthResponse()
 		grpcqueryservice.Register(sourceRdonly.RPCServer, &legacyTestQueryService{
-			t:                        tc.t,
+			t: tc.t,
+
 			StreamHealthQueryService: qs,
 		})
 	}
@@ -295,6 +298,12 @@ func (sq *legacyTestQueryService) StreamExecute(ctx context.Context, target *que
 }
 
 func TestLegacySplitCloneV2(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &legacySplitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -306,6 +315,12 @@ func TestLegacySplitCloneV2(t *testing.T) {
 }
 
 func TestLegacySplitCloneV2_Throttled(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &legacySplitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -345,6 +360,12 @@ func TestLegacySplitCloneV2_Throttled(t *testing.T) {
 // TestLegacySplitCloneV2 with the additional twist that the destination masters
 // fail the first write because they are read-only and succeed after that.
 func TestLegacySplitCloneV2_RetryDueToReadonly(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &legacySplitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -374,6 +395,12 @@ func TestLegacySplitCloneV2_RetryDueToReadonly(t *testing.T) {
 // even in a period where no MASTER tablet is available according to the
 // HealthCheck instance.
 func TestLegacySplitCloneV2_NoMasterAvailable(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &legacySplitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -447,6 +474,12 @@ func TestLegacySplitCloneV2_NoMasterAvailable(t *testing.T) {
 }
 
 func TestLegacySplitCloneV3(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &legacySplitCloneTestCase{t: t}
 	tc.setUp(true /* v3 */)
 	defer tc.tearDown()

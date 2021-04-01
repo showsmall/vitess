@@ -21,7 +21,8 @@ import (
 	"sort"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
@@ -45,14 +46,14 @@ func (wr *Wrangler) GetPermissions(ctx context.Context, tabletAlias *topodatapb.
 func (wr *Wrangler) diffPermissions(ctx context.Context, masterPermissions *tabletmanagerdatapb.Permissions, masterAlias *topodatapb.TabletAlias, alias *topodatapb.TabletAlias, wg *sync.WaitGroup, er concurrency.ErrorRecorder) {
 	defer wg.Done()
 	log.Infof("Gathering permissions for %v", topoproto.TabletAliasString(alias))
-	slavePermissions, err := wr.GetPermissions(ctx, alias)
+	replicaPermissions, err := wr.GetPermissions(ctx, alias)
 	if err != nil {
 		er.RecordError(err)
 		return
 	}
 
 	log.Infof("Diffing permissions for %v", topoproto.TabletAliasString(alias))
-	tmutils.DiffPermissions(topoproto.TabletAliasString(masterAlias), masterPermissions, topoproto.TabletAliasString(alias), slavePermissions, er)
+	tmutils.DiffPermissions(topoproto.TabletAliasString(masterAlias), masterPermissions, topoproto.TabletAliasString(alias), replicaPermissions, er)
 }
 
 // ValidatePermissionsShard validates all the permissions are the same

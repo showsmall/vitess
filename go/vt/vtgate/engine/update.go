@@ -21,6 +21,8 @@ import (
 	"sort"
 	"time"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -36,14 +38,17 @@ import (
 var _ Primitive = (*Update)(nil)
 
 // VindexValues contains changed values for a vindex.
-type VindexValues map[string]sqltypes.PlanValue
+type VindexValues struct {
+	PvMap  map[string]sqltypes.PlanValue
+	Offset int // Offset from ownedVindexQuery to provide input decision for vindex update.
+}
 
 // Update represents the instructions to perform an update.
 type Update struct {
 	DML
 
 	// ChangedVindexValues contains values for updated Vindexes during an update statement.
-	ChangedVindexValues map[string]VindexValues
+	ChangedVindexValues map[string]*VindexValues
 
 	// Update does not take inputs
 	noInputs
@@ -112,7 +117,7 @@ func (upd *Update) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindV
 func (upd *Update) execUpdateUnsharded(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	rss, _, err := vcursor.ResolveDestinations(upd.Keyspace.Name, nil, []key.Destination{key.DestinationAllShards{}})
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execUpdateUnsharded")
+		return nil, err
 	}
 	if len(rss) != 1 {
 		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "Keyspace does not have exactly one shard: %v", rss)
@@ -127,11 +132,11 @@ func (upd *Update) execUpdateUnsharded(vcursor VCursor, bindVars map[string]*que
 func (upd *Update) execUpdateEqual(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	key, err := upd.Values[0].ResolveValue(bindVars)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execUpdateEqual")
+		return nil, err
 	}
 	rs, ksid, err := resolveSingleShard(vcursor, upd.Vindex, upd.Keyspace, key)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execUpdateEqual")
+		return nil, err
 	}
 	err = allowOnlyMaster(rs)
 	if err != nil {
@@ -142,7 +147,7 @@ func (upd *Update) execUpdateEqual(vcursor VCursor, bindVars map[string]*querypb
 	}
 	if len(upd.ChangedVindexValues) != 0 {
 		if err := upd.updateVindexEntries(vcursor, bindVars, []*srvtopo.ResolvedShard{rs}); err != nil {
-			return nil, vterrors.Wrap(err, "execUpdateEqual")
+			return nil, err
 		}
 	}
 	return execShard(vcursor, upd.Query, bindVars, rs, true /* rollbackOnError */, true /* canAutocommit */)
@@ -159,7 +164,7 @@ func (upd *Update) execUpdateIn(vcursor VCursor, bindVars map[string]*querypb.Bi
 	}
 	if len(upd.ChangedVindexValues) != 0 {
 		if err := upd.updateVindexEntries(vcursor, bindVars, rss); err != nil {
-			return nil, vterrors.Wrap(err, "execUpdateIn")
+			return nil, err
 		}
 	}
 	return execMultiShard(vcursor, rss, queries, upd.MultiShardAutocommit)
@@ -168,7 +173,7 @@ func (upd *Update) execUpdateIn(vcursor VCursor, bindVars map[string]*querypb.Bi
 func (upd *Update) execUpdateByDestination(vcursor VCursor, bindVars map[string]*querypb.BindVariable, dest key.Destination) (*sqltypes.Result, error) {
 	rss, _, err := vcursor.ResolveDestinations(upd.Keyspace.Name, nil, []key.Destination{dest})
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execUpdateByDestination")
+		return nil, err
 	}
 	err = allowOnlyMaster(rss...)
 	if err != nil {
@@ -186,7 +191,7 @@ func (upd *Update) execUpdateByDestination(vcursor VCursor, bindVars map[string]
 	// update any owned vindexes
 	if len(upd.ChangedVindexValues) != 0 {
 		if err := upd.updateVindexEntries(vcursor, bindVars, rss); err != nil {
-			return nil, vterrors.Wrap(err, "execUpdateByDestination")
+			return nil, err
 		}
 	}
 	return execMultiShard(vcursor, rss, queries, upd.MultiShardAutocommit)
@@ -206,7 +211,7 @@ func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*que
 	subQueryResult, errors := vcursor.ExecuteMultiShard(rss, queries, false, false)
 	for _, err := range errors {
 		if err != nil {
-			return vterrors.Wrap(err, "updateVindexEntries")
+			return err
 		}
 	}
 
@@ -227,13 +232,23 @@ func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*que
 		for _, colVindex := range upd.Table.Owned {
 			// Update columns only if they're being changed.
 			if updColValues, ok := upd.ChangedVindexValues[colVindex.Name]; ok {
+				offset := updColValues.Offset
+				if !row[offset].IsNull() {
+					val, err := evalengine.ToInt64(row[offset])
+					if err != nil {
+						return err
+					}
+					if val == int64(1) { // 1 means that the old and new value are same and vindex update is not required.
+						continue
+					}
+				}
 				fromIds := make([]sqltypes.Value, 0, len(colVindex.Columns))
 				var vindexColumnKeys []sqltypes.Value
 				for _, vCol := range colVindex.Columns {
 					// Fetch the column values.
 					origColValue := row[fieldColNumMap[vCol.String()]]
 					fromIds = append(fromIds, origColValue)
-					if colValue, exists := updColValues[vCol.String()]; exists {
+					if colValue, exists := updColValues.PvMap[vCol.String()]; exists {
 						resolvedVal, err := colValue.ResolveValue(bindVars)
 						if err != nil {
 							return err
@@ -266,8 +281,8 @@ func (upd *Update) description() PrimitiveDescription {
 	addFieldsIfNotEmpty(upd.DML, other)
 
 	var changedVindexes []string
-	for vindex := range upd.ChangedVindexValues {
-		changedVindexes = append(changedVindexes, vindex)
+	for k, v := range upd.ChangedVindexValues {
+		changedVindexes = append(changedVindexes, fmt.Sprintf("%s:%d", k, v.Offset))
 	}
 	sort.Strings(changedVindexes) // We sort these so random changes in the map order does not affect output
 	if len(changedVindexes) > 0 {

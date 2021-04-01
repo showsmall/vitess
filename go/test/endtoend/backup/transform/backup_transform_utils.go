@@ -29,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/sharding/initialsharding"
 	"vitess.io/vitess/go/vt/log"
@@ -185,7 +186,7 @@ var vtInsertTest = `create table vt_insert_test (
 
 // TestBackupTransformImpl tests backups with transform hooks
 func TestBackupTransformImpl(t *testing.T) {
-	// insert data in master, validate same in slave
+	// insert data in master, validate same in replica
 	defer cluster.PanicHandler(t)
 	verifyInitialReplication(t)
 
@@ -260,7 +261,7 @@ func TestBackupTransformImpl(t *testing.T) {
 		verifyReplicationStatus(t, replica2, "OFF")
 	}
 
-	// validate that new slave has all the data
+	// validate that new replica has all the data
 	cluster.VerifyRowsInTablet(t, replica2, keyspaceName, 2)
 
 	// Remove all backups

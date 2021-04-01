@@ -17,13 +17,16 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
+	"vitess.io/vitess/go/vt/log"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/concurrency"
@@ -47,6 +50,9 @@ type resharder struct {
 	targetMasters map[string]*topo.TabletInfo
 	vschema       *vschemapb.Keyspace
 	refStreams    map[string]*refStream
+	cell          string //single cell or cellsAlias or comma-separated list of cells/cellsAliases
+	tabletTypes   string
+	stopAfterCopy bool
 }
 
 type refStream struct {
@@ -57,15 +63,22 @@ type refStream struct {
 }
 
 // Reshard initiates a resharding workflow.
-func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sources, targets []string, skipSchemaCopy bool) error {
+func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sources, targets []string,
+	skipSchemaCopy bool, cell, tabletTypes string, autoStart, stopAfterCopy bool) error {
 	if err := wr.validateNewWorkflow(ctx, keyspace, workflow); err != nil {
 		return err
 	}
+	if err := wr.ts.ValidateSrvKeyspace(ctx, keyspace, cell); err != nil {
+		err2 := vterrors.Wrapf(err, "SrvKeyspace for keyspace %s is corrupt in cell %s", keyspace, cell)
+		log.Errorf("%w", err2)
+		return err2
+	}
 
-	rs, err := wr.buildResharder(ctx, keyspace, workflow, sources, targets)
+	rs, err := wr.buildResharder(ctx, keyspace, workflow, sources, targets, cell, tabletTypes)
 	if err != nil {
 		return vterrors.Wrap(err, "buildResharder")
 	}
+	rs.stopAfterCopy = stopAfterCopy
 	if !skipSchemaCopy {
 		if err := rs.copySchema(ctx); err != nil {
 			return vterrors.Wrap(err, "copySchema")
@@ -74,19 +87,26 @@ func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sour
 	if err := rs.createStreams(ctx); err != nil {
 		return vterrors.Wrap(err, "createStreams")
 	}
-	if err := rs.startStreams(ctx); err != nil {
-		return vterrors.Wrap(err, "startStream")
+
+	if autoStart {
+		if err := rs.startStreams(ctx); err != nil {
+			return vterrors.Wrap(err, "startStreams")
+		}
+	} else {
+		wr.Logger().Infof("Streams will not be started since -auto_start is set to false")
 	}
 	return nil
 }
 
-func (wr *Wrangler) buildResharder(ctx context.Context, keyspace, workflow string, sources, targets []string) (*resharder, error) {
+func (wr *Wrangler) buildResharder(ctx context.Context, keyspace, workflow string, sources, targets []string, cell, tabletTypes string) (*resharder, error) {
 	rs := &resharder{
 		wr:            wr,
 		keyspace:      keyspace,
 		workflow:      workflow,
 		sourceMasters: make(map[string]*topo.TabletInfo),
 		targetMasters: make(map[string]*topo.TabletInfo),
+		cell:          cell,
+		tabletTypes:   tabletTypes,
 	}
 	for _, shard := range sources {
 		si, err := wr.ts.GetShard(ctx, keyspace, shard)
@@ -158,7 +178,7 @@ func (rs *resharder) readRefStreams(ctx context.Context) error {
 	err := rs.forAll(rs.sourceShards, func(source *topo.ShardInfo) error {
 		sourceMaster := rs.sourceMasters[source.ShardName()]
 
-		query := fmt.Sprintf("select workflow, source, cell, tablet_types from _vt.vreplication where db_name=%s", encodeString(sourceMaster.DbName()))
+		query := fmt.Sprintf("select workflow, source, cell, tablet_types from _vt.vreplication where db_name=%s and message != 'FROZEN'", encodeString(sourceMaster.DbName()))
 		p3qr, err := rs.wr.tmc.VReplicationExec(ctx, sourceMaster.Tablet, query)
 		if err != nil {
 			return vterrors.Wrapf(err, "VReplicationExec(%v, %s)", sourceMaster.Tablet, query)
@@ -181,6 +201,7 @@ func (rs *resharder) readRefStreams(ctx context.Context) error {
 			}
 		}
 		for _, row := range qr.Rows {
+
 			workflow := row[0].ToString()
 			if workflow == "" {
 				return fmt.Errorf("VReplication streams must have named workflows for migration: shard: %s:%s", source.Keyspace(), source.ShardName())
@@ -294,11 +315,12 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 				}),
 			}
 			bls := &binlogdatapb.BinlogSource{
-				Keyspace: rs.keyspace,
-				Shard:    source.ShardName(),
-				Filter:   filter,
+				Keyspace:      rs.keyspace,
+				Shard:         source.ShardName(),
+				Filter:        filter,
+				StopAfterCopy: rs.stopAfterCopy,
 			}
-			ig.AddRow(rs.workflow, bls, "", "", "")
+			ig.AddRow(rs.workflow, bls, "", rs.cell, rs.tabletTypes)
 		}
 
 		for _, rstream := range rs.refStreams {

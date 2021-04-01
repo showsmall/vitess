@@ -17,6 +17,7 @@ limitations under the License.
 package vreplication
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,20 +25,22 @@ import (
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-	"vitess.io/vitess/go/vt/withddl"
-
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle"
+	"vitess.io/vitess/go/vt/withddl"
 )
 
 const (
@@ -61,6 +64,10 @@ const (
 
 var withDDL *withddl.WithDDL
 
+const (
+	throttlerAppName = "vreplication"
+)
+
 func init() {
 	allddls := append([]string{}, binlogplayer.CreateVReplicationTable()...)
 	allddls = append(allddls, binlogplayer.AlterVReplicationTable...)
@@ -68,7 +75,9 @@ func init() {
 	withDDL = withddl.New(allddls)
 }
 
-var tabletTypesStr = flag.String("vreplication_tablet_type", "REPLICA", "comma separated list of tablet types used as a source")
+// this are the default tablet_types that will be used by the tablet picker to find sources for a vreplication stream
+// it can be overridden by passing a different list to the MoveTables or Reshard commands
+var tabletTypesStr = flag.String("vreplication_tablet_type", "MASTER,REPLICA", "comma separated list of tablet types used as a source")
 
 // waitRetryTime can be changed to a smaller value for tests.
 // A VReplication stream can be created by sending an insert statement
@@ -81,9 +90,13 @@ var waitRetryTime = 1 * time.Second
 
 // Engine is the engine for handling vreplication.
 type Engine struct {
-	// mu synchronizes isOpen, controllers and wg.
-	mu          sync.Mutex
-	isOpen      bool
+	// mu synchronizes isOpen, cancelRetry, controllers and wg.
+	mu     sync.Mutex
+	isOpen bool
+	// If cancelRetry is set, then a retry loop is running.
+	// Invoking the function guarantees that there will be
+	// no more retries.
+	cancelRetry context.CancelFunc
 	controllers map[int]*controller
 	// wg is used by in-flight functions that can run for long periods.
 	wg sync.WaitGroup
@@ -101,6 +114,8 @@ type Engine struct {
 
 	journaler map[string]*journalEvent
 	ec        *externalConnector
+
+	throttlerClient *throttle.Client
 }
 
 type journalEvent struct {
@@ -111,14 +126,15 @@ type journalEvent struct {
 
 // NewEngine creates a new Engine.
 // A nil ts means that the Engine is disabled.
-func NewEngine(config *tabletenv.TabletConfig, ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon) *Engine {
+func NewEngine(config *tabletenv.TabletConfig, ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, lagThrottler *throttle.Throttler) *Engine {
 	vre := &Engine{
-		controllers: make(map[int]*controller),
-		ts:          ts,
-		cell:        cell,
-		mysqld:      mysqld,
-		journaler:   make(map[string]*journalEvent),
-		ec:          newExternalConnector(config.ExternalConnections),
+		controllers:     make(map[int]*controller),
+		ts:              ts,
+		cell:            cell,
+		mysqld:          mysqld,
+		journaler:       make(map[string]*journalEvent),
+		ec:              newExternalConnector(config.ExternalConnections),
+		throttlerClient: throttle.NewBackgroundClient(lagThrottler, throttlerAppName, throttle.ThrottleCheckPrimaryWrite),
 	}
 	return vre
 }
@@ -151,47 +167,89 @@ func NewTestEngine(ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, db
 }
 
 // Open starts the Engine service.
-func (vre *Engine) Open(ctx context.Context) error {
+func (vre *Engine) Open(ctx context.Context) {
 	vre.mu.Lock()
 	defer vre.mu.Unlock()
+
 	if vre.ts == nil {
-		log.Info("ts is nil: disabling vreplication engine")
-		return nil
+		return
 	}
 	if vre.isOpen {
-		return nil
+		return
 	}
-	log.Infof("Starting VReplication engine")
+	log.Infof("VReplication Engine: opening")
+
+	// Cancel any existing retry loops.
+	// This guarantees that there will be no more
+	// retries unless we start a new loop.
+	if vre.cancelRetry != nil {
+		vre.cancelRetry()
+		vre.cancelRetry = nil
+	}
+
+	if err := vre.openLocked(ctx); err != nil {
+		ctx, cancel := context.WithCancel(ctx)
+		vre.cancelRetry = cancel
+		go vre.retry(ctx, err)
+	}
+}
+
+func (vre *Engine) openLocked(ctx context.Context) error {
+	rows, err := vre.readAllRows(ctx)
+	if err != nil {
+		return err
+	}
 
 	vre.ctx, vre.cancel = context.WithCancel(ctx)
 	vre.isOpen = true
-	if err := vre.initAll(); err != nil {
-		go vre.Close()
-		return err
-	}
+	vre.initControllers(rows)
 	vre.updateStats()
 	return nil
 }
 
-func (vre *Engine) initAll() error {
-	dbClient := vre.dbClientFactory()
-	if err := dbClient.Connect(); err != nil {
-		return err
-	}
-	defer dbClient.Close()
+var openRetryInterval = sync2.NewAtomicDuration(1 * time.Second)
 
-	rows, err := readAllRows(vre.ctx, dbClient, vre.dbName)
-	if err != nil {
-		return err
+func (vre *Engine) retry(ctx context.Context, err error) {
+	log.Errorf("Error starting vreplication engine: %v, will keep retrying.", err)
+	for {
+		timer := time.NewTimer(openRetryInterval.Get())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		vre.mu.Lock()
+		// Recheck the context within the lock.
+		// This guarantees that we will not retry
+		// after the context was canceled. This
+		// can almost never happen.
+		select {
+		case <-ctx.Done():
+			vre.mu.Unlock()
+			return
+		default:
+		}
+		if err := vre.openLocked(ctx); err == nil {
+			// Don't invoke cancelRetry because openLocked
+			// will hold on to this context for later cancelation.
+			vre.cancelRetry = nil
+			vre.mu.Unlock()
+			return
+		}
+		vre.mu.Unlock()
 	}
+}
+
+func (vre *Engine) initControllers(rows []map[string]string) {
 	for _, row := range rows {
 		ct, err := newController(vre.ctx, row, vre.dbClientFactory, vre.mysqld, vre.ts, vre.cell, *tabletTypesStr, nil, vre)
 		if err != nil {
-			return err
+			log.Errorf("Controller could not be initialized for stream: %v", row)
+			continue
 		}
 		vre.controllers[int(ct.id)] = ct
 	}
-	return nil
 }
 
 // IsOpen returns true if Engine is open.
@@ -205,10 +263,18 @@ func (vre *Engine) IsOpen() bool {
 func (vre *Engine) Close() {
 	vre.mu.Lock()
 	defer vre.mu.Unlock()
+
+	// If we're retrying, we're not open.
+	// Just cancel the retry loop.
+	if vre.cancelRetry != nil {
+		vre.cancelRetry()
+		vre.cancelRetry = nil
+		return
+	}
+
 	if !vre.isOpen {
 		return
 	}
-	log.Infof("Shutting down VReplication engine")
 
 	vre.ec.Close()
 	vre.cancel()
@@ -225,6 +291,7 @@ func (vre *Engine) Close() {
 	vre.isOpen = false
 
 	vre.updateStats()
+	log.Infof("VReplication Engine: closed")
 }
 
 // Exec executes the query and the related actions.
@@ -240,7 +307,10 @@ func (vre *Engine) Exec(query string) (*sqltypes.Result, error) {
 	vre.mu.Lock()
 	defer vre.mu.Unlock()
 	if !vre.isOpen {
-		return nil, errors.New("vreplication engine is closed")
+		return nil, vterrors.New(vtrpcpb.Code_UNAVAILABLE, "vreplication engine is closed")
+	}
+	if vre.cancelRetry != nil {
+		return nil, vterrors.New(vtrpcpb.Code_UNAVAILABLE, "engine is still trying to open")
 	}
 	defer vre.updateStats()
 
@@ -646,8 +716,13 @@ func (vre *Engine) updateStats() {
 	}
 }
 
-func readAllRows(ctx context.Context, dbClient binlogplayer.DBClient, dbName string) ([]map[string]string, error) {
-	qr, err := withDDL.ExecIgnore(ctx, fmt.Sprintf("select * from _vt.vreplication where db_name=%v", encodeString(dbName)), dbClient.ExecuteFetch)
+func (vre *Engine) readAllRows(ctx context.Context) ([]map[string]string, error) {
+	dbClient := vre.dbClientFactory()
+	if err := dbClient.Connect(); err != nil {
+		return nil, err
+	}
+	defer dbClient.Close()
+	qr, err := withDDL.ExecIgnore(ctx, fmt.Sprintf("select * from _vt.vreplication where db_name=%v", encodeString(vre.dbName)), dbClient.ExecuteFetch)
 	if err != nil {
 		return nil, err
 	}

@@ -18,15 +18,20 @@ package engine
 
 import (
 	"encoding/json"
-	"sync"
+	"sync/atomic"
 	"time"
+
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
+
+	"golang.org/x/sync/errgroup"
 
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/srvtopo"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -49,11 +54,20 @@ type (
 		// Context returns the context of the current request.
 		Context() context.Context
 
+		GetKeyspace() string
 		// MaxMemoryRows returns the maxMemoryRows flag value.
 		MaxMemoryRows() int
 
+		// ExceedsMaxMemoryRows returns a boolean indicating whether
+		// the maxMemoryRows value has been exceeded. Returns false
+		// if the max memory rows override directive is set to true
+		ExceedsMaxMemoryRows(numRows int) bool
+
 		// SetContextTimeout updates the context and sets a timeout.
 		SetContextTimeout(timeout time.Duration) context.CancelFunc
+
+		// ErrorGroupCancellableContext updates context that can be cancelled.
+		ErrorGroupCancellableContext() (*errgroup.Group, func())
 
 		// V3 functions.
 		Execute(method string, query string, bindvars map[string]*querypb.BindVariable, rollbackOnError bool, co vtgatepb.CommitOrder) (*sqltypes.Result, error)
@@ -71,9 +85,25 @@ type (
 		// Will replace all of the Topo functions.
 		ResolveDestinations(keyspace string, ids []*querypb.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error)
 
-		ExecuteVSchema(keyspace string, vschemaDDL *sqlparser.DDL) error
+		ExecuteVSchema(keyspace string, vschemaDDL *sqlparser.AlterVschema) error
+
+		SubmitOnlineDDL(onlineDDl *schema.OnlineDDL) error
 
 		Session() SessionActions
+
+		ExecuteLock(rs *srvtopo.ResolvedShard, query *querypb.BoundQuery) (*sqltypes.Result, error)
+
+		InTransactionAndIsDML() bool
+
+		LookupRowLockShardSession() vtgatepb.CommitOrder
+
+		FindRoutedTable(tablename sqlparser.TableName) (*vindexes.Table, error)
+
+		// GetDBDDLPlugin gets the configured plugin for DROP/CREATE DATABASE
+		GetDBDDLPluginName() string
+
+		// KeyspaceAvailable returns true when a keyspace is visible from vtgate
+		KeyspaceAvailable(ks string) bool
 	}
 
 	//SessionActions gives primitives ability to interact with the session state
@@ -86,6 +116,40 @@ type (
 		SetUDV(key string, value interface{}) error
 
 		SetSysVar(name string, expr string)
+
+		// NeedsReservedConn marks this session as needing a dedicated connection to underlying database
+		NeedsReservedConn()
+
+		// InReservedConn provides whether this session is using reserved connection
+		InReservedConn() bool
+
+		// ShardSession returns shard info about open connections
+		ShardSession() []*srvtopo.ResolvedShard
+
+		SetAutocommit(bool) error
+		SetClientFoundRows(bool) error
+		SetSkipQueryPlanCache(bool) error
+		SetSQLSelectLimit(int64) error
+		SetTransactionMode(vtgatepb.TransactionMode)
+		SetWorkload(querypb.ExecuteOptions_Workload)
+		SetPlannerVersion(querypb.ExecuteOptions_PlannerVersion)
+		SetFoundRows(uint64)
+
+		SetDDLStrategy(string)
+		GetDDLStrategy() string
+
+		GetSessionUUID() string
+
+		SetSessionEnableSystemSettings(bool) error
+		GetSessionEnableSystemSettings() bool
+
+		// SetReadAfterWriteGTID sets the GTID that the user expects a replica to have caught up with before answering a query
+		SetReadAfterWriteGTID(string)
+		SetReadAfterWriteTimeout(float64)
+		SetSessionTrackGTIDs(bool)
+
+		// HasCreatedTempTable will mark the session as having created temp tables
+		HasCreatedTempTable()
 	}
 
 	// Plan represents the execution strategy for a given query.
@@ -94,17 +158,18 @@ type (
 	// each node does its part by combining the results of the
 	// sub-nodes.
 	Plan struct {
-		Type                   sqlparser.StatementType // The type of query we have
-		Original               string                  // Original is the original query.
-		Instructions           Primitive               // Instructions contains the instructions needed to fulfil the query.
-		sqlparser.BindVarNeeds                         // Stores BindVars needed to be provided as part of expression rewriting
+		Type         sqlparser.StatementType // The type of query we have
+		Original     string                  // Original is the original query.
+		Instructions Primitive               // Instructions contains the instructions needed to fulfil the query.
+		BindVarNeeds *sqlparser.BindVarNeeds // Stores BindVars needed to be provided as part of expression rewriting
+		Warnings     []*querypb.QueryWarning // Warnings that need to be yielded every time this query runs
 
-		mu           sync.Mutex    // Mutex to protect the fields below
-		ExecCount    uint64        // Count of times this plan was executed
-		ExecTime     time.Duration // Total execution time
-		ShardQueries uint64        // Total number of shard queries
-		Rows         uint64        // Total number of rows
-		Errors       uint64        // Total number of errors
+		ExecCount    uint64 // Count of times this plan was executed
+		ExecTime     uint64 // Total execution time
+		ShardQueries uint64 // Total number of shard queries
+		RowsReturned uint64 // Total number of rows
+		RowsAffected uint64 // Total number of rows
+		Errors       uint64 // Total number of errors
 	}
 
 	// Match is used to check if a Primitive matches
@@ -119,7 +184,7 @@ type (
 		GetKeyspaceName() string
 		GetTableName() string
 		Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
-		StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantields bool, callback func(*sqltypes.Result) error) error
+		StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
 		GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
 		NeedsTransaction() bool
 
@@ -142,25 +207,23 @@ type (
 )
 
 // AddStats updates the plan execution statistics
-func (p *Plan) AddStats(execCount uint64, execTime time.Duration, shardQueries, rows, errors uint64) {
-	p.mu.Lock()
-	p.ExecCount += execCount
-	p.ExecTime += execTime
-	p.ShardQueries += shardQueries
-	p.Rows += rows
-	p.Errors += errors
-	p.mu.Unlock()
+func (p *Plan) AddStats(execCount uint64, execTime time.Duration, shardQueries, rowsAffected, rowsReturned, errors uint64) {
+	atomic.AddUint64(&p.ExecCount, execCount)
+	atomic.AddUint64(&p.ExecTime, uint64(execTime))
+	atomic.AddUint64(&p.ShardQueries, shardQueries)
+	atomic.AddUint64(&p.RowsAffected, rowsAffected)
+	atomic.AddUint64(&p.RowsReturned, rowsReturned)
+	atomic.AddUint64(&p.Errors, errors)
 }
 
 // Stats returns a copy of the plan execution statistics
-func (p *Plan) Stats() (execCount uint64, execTime time.Duration, shardQueries, rows, errors uint64) {
-	p.mu.Lock()
-	execCount = p.ExecCount
-	execTime = p.ExecTime
-	shardQueries = p.ShardQueries
-	rows = p.Rows
-	errors = p.Errors
-	p.mu.Unlock()
+func (p *Plan) Stats() (execCount uint64, execTime time.Duration, shardQueries, rowsAffected, rowsReturned, errors uint64) {
+	execCount = atomic.LoadUint64(&p.ExecCount)
+	execTime = time.Duration(atomic.LoadUint64(&p.ExecTime))
+	shardQueries = atomic.LoadUint64(&p.ShardQueries)
+	rowsAffected = atomic.LoadUint64(&p.RowsAffected)
+	rowsReturned = atomic.LoadUint64(&p.RowsReturned)
+	errors = atomic.LoadUint64(&p.Errors)
 	return
 }
 
@@ -183,13 +246,6 @@ func Exists(m Match, p Primitive) bool {
 	return Find(m, p) != nil
 }
 
-// Size is defined so that Plan can be given to a cache.LRUCache.
-// VTGate needs to maintain a cache of plans. It uses LRUCache, which
-// in turn requires its objects to define a Size function.
-func (p *Plan) Size() int {
-	return 1
-}
-
 //MarshalJSON serializes the plan into a JSON representation.
 func (p *Plan) MarshalJSON() ([]byte, error) {
 	var instructions *PrimitiveDescription
@@ -205,17 +261,19 @@ func (p *Plan) MarshalJSON() ([]byte, error) {
 		ExecCount    uint64                `json:",omitempty"`
 		ExecTime     time.Duration         `json:",omitempty"`
 		ShardQueries uint64                `json:",omitempty"`
-		Rows         uint64                `json:",omitempty"`
+		RowsAffected uint64                `json:",omitempty"`
+		RowsReturned uint64                `json:",omitempty"`
 		Errors       uint64                `json:",omitempty"`
 	}{
 		QueryType:    p.Type.String(),
 		Original:     p.Original,
 		Instructions: instructions,
-		ExecCount:    p.ExecCount,
-		ExecTime:     p.ExecTime,
-		ShardQueries: p.ShardQueries,
-		Rows:         p.Rows,
-		Errors:       p.Errors,
+		ExecCount:    atomic.LoadUint64(&p.ExecCount),
+		ExecTime:     time.Duration(atomic.LoadUint64(&p.ExecTime)),
+		ShardQueries: atomic.LoadUint64(&p.ShardQueries),
+		RowsAffected: atomic.LoadUint64(&p.RowsAffected),
+		RowsReturned: atomic.LoadUint64(&p.RowsReturned),
+		Errors:       atomic.LoadUint64(&p.Errors),
 	}
 	return json.Marshal(marshalPlan)
 }

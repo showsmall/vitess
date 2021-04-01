@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -72,7 +73,7 @@ func TestLookupUniqueMap(t *testing.T) {
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("1")),
-		key.DestinationKeyspaceID([]byte("1")),
+		key.DestinationNone{},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Map(): %+v, want %+v", got, want)

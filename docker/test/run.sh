@@ -98,7 +98,8 @@ while true ; do
 done
 # Positional flags.
 flavor=$1
-cmd=$2
+version=${2:-0}
+cmd=$3
 args=
 
 if [[ -z "$flavor" ]]; then
@@ -115,7 +116,7 @@ if [[ ! -f bootstrap.sh ]]; then
   exit 1
 fi
 
-image=vitess/bootstrap:$flavor
+image=vitess/bootstrap:$version-$flavor
 if [[ -n "$existing_cache_image" ]]; then
   image=$existing_cache_image
 fi
@@ -139,6 +140,7 @@ args="$args -v /tmp/mavencache:/home/vitess/.m2"
 
 # Add in the vitess user
 args="$args --user vitess"
+args="$args -v $PWD/test/bin:/tmp/bin"
 
 # Mount in host VTDATAROOT if one exists, since it might be a RAM disk or SSD.
 if [[ -n "$VTDATAROOT" ]]; then
@@ -172,6 +174,7 @@ fi
 # Reset the environment if this was an old bootstrap. We can detect this from VTTOP presence.
 bashcmd=$(append_cmd "$bashcmd" "export VTROOT=/vt/src/vitess.io/vitess")
 bashcmd=$(append_cmd "$bashcmd" "export VTDATAROOT=/vt/vtdataroot")
+bashcmd=$(append_cmd "$bashcmd" "export EXTRA_BIN=/tmp/bin")
 
 bashcmd=$(append_cmd "$bashcmd" "mkdir -p dist; mkdir -p bin; mkdir -p lib; mkdir -p vthook")
 bashcmd=$(append_cmd "$bashcmd" "rm -rf /vt/dist; ln -s /vt/src/vitess.io/vitess/dist /vt/dist")

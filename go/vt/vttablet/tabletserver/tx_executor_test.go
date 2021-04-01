@@ -25,9 +25,10 @@ import (
 
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
@@ -500,7 +501,7 @@ func newTestTxExecutor(t *testing.T) (txe *TxExecutor, tsv *TabletServer, db *fa
 	db.AddQueryPattern("insert into _vt\\.redo_statement.*", &sqltypes.Result{})
 	db.AddQuery("delete from _vt.redo_state where dtid = 'aa'", &sqltypes.Result{})
 	db.AddQuery("delete from _vt.redo_statement where dtid = 'aa'", &sqltypes.Result{})
-	db.AddQuery("update test_table set name = 2 where pk = 1 limit 10001", &sqltypes.Result{})
+	db.AddQuery("update test_table set `name` = 2 where pk = 1 limit 10001", &sqltypes.Result{})
 	return &TxExecutor{
 		ctx:      ctx,
 		logStats: logStats,
@@ -517,7 +518,7 @@ func newShortAgeExecutor(t *testing.T) (txe *TxExecutor, tsv *TabletServer, db *
 	db.AddQueryPattern("insert into _vt\\.redo_statement.*", &sqltypes.Result{})
 	db.AddQuery("delete from _vt.redo_state where dtid = 'aa'", &sqltypes.Result{})
 	db.AddQuery("delete from _vt.redo_statement where dtid = 'aa'", &sqltypes.Result{})
-	db.AddQuery("update test_table set name = 2 where pk = 1 limit 10001", &sqltypes.Result{})
+	db.AddQuery("update test_table set `name` = 2 where pk = 1 limit 10001", &sqltypes.Result{})
 	return &TxExecutor{
 		ctx:      ctx,
 		logStats: logStats,
@@ -541,7 +542,7 @@ func newNoTwopcExecutor(t *testing.T) (txe *TxExecutor, tsv *TabletServer, db *f
 func newTxForPrep(tsv *TabletServer) int64 {
 	txid := newTransaction(tsv, nil)
 	target := querypb.Target{TabletType: topodatapb.TabletType_MASTER}
-	_, err := tsv.Execute(ctx, &target, "update test_table set name = 2 where pk = 1", nil, txid, nil)
+	_, err := tsv.Execute(ctx, &target, "update test_table set name = 2 where pk = 1", nil, txid, 0, nil)
 	if err != nil {
 		panic(err)
 	}

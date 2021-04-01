@@ -56,13 +56,30 @@ func (buf *TrackedBuffer) WriteNode(node SQLNode) *TrackedBuffer {
 // Myprintf mimics fmt.Fprintf(buf, ...), but limited to Node(%v),
 // Node.Value(%s) and string(%s). It also allows a %a for a value argument, in
 // which case it adds tracking info for future substitutions.
-// It adds parens as needed to follow precedence rules when printing expressions
+// It adds parens as needed to follow precedence rules when printing expressions.
+// To handle parens correctly for left associative binary operators,
+// use %l and %r to tell the TrackedBuffer which value is on the LHS and RHS
 //
 // The name must be something other than the usual Printf() to avoid "go vet"
 // warnings due to our custom format specifiers.
 // *** THIS METHOD SHOULD NOT BE USED FROM ast.go. USE astPrintf INSTEAD ***
 func (buf *TrackedBuffer) Myprintf(format string, values ...interface{}) {
 	buf.astPrintf(nil, format, values...)
+}
+
+func (buf *TrackedBuffer) printExpr(currentExpr Expr, expr Expr, left bool) {
+	if precedenceFor(currentExpr) == Syntactic {
+		expr.formatFast(buf)
+	} else {
+		needParens := needParens(currentExpr, expr, left)
+		if needParens {
+			buf.WriteByte('(')
+		}
+		expr.formatFast(buf)
+		if needParens {
+			buf.WriteByte(')')
+		}
+	}
 }
 
 // astPrintf is for internal use by the ast structs
@@ -87,7 +104,8 @@ func (buf *TrackedBuffer) astPrintf(currentNode SQLNode, format string, values .
 			break
 		}
 		i++ // '%'
-		switch format[i] {
+		token := format[i]
+		switch token {
 		case 'c':
 			switch v := values[fieldnum].(type) {
 			case byte:
@@ -106,19 +124,23 @@ func (buf *TrackedBuffer) astPrintf(currentNode SQLNode, format string, values .
 			default:
 				panic(fmt.Sprintf("unexpected TrackedBuffer type %T", v))
 			}
-		case 'v':
+		case 'l', 'r', 'v':
+			left := token != 'r'
 			value := values[fieldnum]
 			expr := getExpressionForParensEval(checkParens, value)
 
-			if expr != nil { //
-				needParens := needParens(currentExpr, expr)
-				buf.printIf(needParens, "(")
-				buf.formatter(expr)
-				buf.printIf(needParens, ")")
-			} else {
+			if expr == nil {
 				buf.formatter(value.(SQLNode))
+			} else {
+				needParens := needParens(currentExpr, expr, left)
+				if needParens {
+					buf.WriteByte('(')
+				}
+				buf.formatter(expr)
+				if needParens {
+					buf.WriteByte(')')
+				}
 			}
-
 		case 'a':
 			buf.WriteArg(values[fieldnum].(string))
 		default:
@@ -139,21 +161,24 @@ func getExpressionForParensEval(checkParens bool, value interface{}) Expr {
 	return nil
 }
 
-func (buf *TrackedBuffer) printIf(condition bool, text string) {
-	if condition {
-		buf.WriteString(text)
-	}
-}
-
 func (buf *TrackedBuffer) formatter(node SQLNode) {
 	if buf.nodeFormatter == nil {
-		node.Format(buf)
+		node.formatFast(buf)
 	} else {
 		buf.nodeFormatter(buf, node)
 	}
 }
 
-func needParens(op, val Expr) bool {
+//needParens says if we need a parenthesis
+// op is the operator we are printing
+// val is the value we are checking if we need parens around or not
+// left let's us know if the value is on the lhs or rhs of the operator
+func needParens(op, val Expr, left bool) bool {
+	// Values are atomic and never need parens
+	if IsValue(val) {
+		return false
+	}
+
 	if areBothISExpr(op, val) {
 		return true
 	}
@@ -161,7 +186,17 @@ func needParens(op, val Expr) bool {
 	opBinding := precedenceFor(op)
 	valBinding := precedenceFor(val)
 
-	return !(opBinding == Syntactic || valBinding == Syntactic) && valBinding > opBinding
+	if opBinding == Syntactic || valBinding == Syntactic {
+		return false
+	}
+
+	if left {
+		// for left associative operators, if the value is to the left of the operator,
+		// we only need parens if the order is higher for the value expression
+		return valBinding > opBinding
+	}
+
+	return valBinding >= opBinding
 }
 
 func areBothISExpr(op Expr, val Expr) bool {

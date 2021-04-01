@@ -37,6 +37,8 @@ import (
 type VCursor interface {
 	Execute(method string, query string, bindvars map[string]*querypb.BindVariable, rollbackOnError bool, co vtgatepb.CommitOrder) (*sqltypes.Result, error)
 	ExecuteKeyspaceID(keyspace string, ksid []byte, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError, autocommit bool) (*sqltypes.Result, error)
+	InTransactionAndIsDML() bool
+	LookupRowLockShardSession() vtgatepb.CommitOrder
 }
 
 // Vindex defines the interface required to register a vindex.
@@ -161,7 +163,7 @@ func Map(vindex Vindex, vcursor VCursor, rowsColValues [][]sqltypes.Value) ([]ke
 	case SingleColumn:
 		return vindex.Map(vcursor, firstColsOnly(rowsColValues))
 	}
-	return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "vindex does not have Map functions")
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vindex '%T' does not have Map function", vindex)
 }
 
 // Verify invokes the Verify implementation supplied by the vindex.
@@ -172,7 +174,7 @@ func Verify(vindex Vindex, vcursor VCursor, rowsColValues [][]sqltypes.Value, ks
 	case SingleColumn:
 		return vindex.Verify(vcursor, firstColsOnly(rowsColValues), ksids)
 	}
-	return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "vindex does not have Map functions")
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vindex '%T' does not have Verify function", vindex)
 }
 
 func firstColsOnly(rowsColValues [][]sqltypes.Value) []sqltypes.Value {

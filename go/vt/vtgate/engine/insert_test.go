@@ -20,6 +20,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
@@ -55,11 +57,11 @@ func TestInsertUnsharded(t *testing.T) {
 	// Failure cases
 	vc = &loggingVCursor{shardErr: errors.New("shard_error")}
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertUnsharded: shard_error")
+	require.EqualError(t, err, `shard_error`)
 
 	vc = &loggingVCursor{}
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "Keyspace does not have exactly one shard: []")
+	require.EqualError(t, err, `Keyspace does not have exactly one shard: []`)
 }
 
 func TestInsertUnshardedGenerate(t *testing.T) {
@@ -83,6 +85,61 @@ func TestInsertUnshardedGenerate(t *testing.T) {
 				{Value: sqltypes.NULL},
 				{Value: sqltypes.NewInt64(2)},
 				{Value: sqltypes.NULL},
+				{Value: sqltypes.NewInt64(3)},
+			},
+		},
+	}
+
+	vc := newDMLTestVCursor("0")
+	vc.results = []*sqltypes.Result{
+		sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"nextval",
+				"int64",
+			),
+			"4",
+		),
+		{InsertID: 1},
+	}
+
+	result, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vc.ExpectLog(t, []string{
+		// Fetch two sequence value.
+		`ResolveDestinations ks2 [] Destinations:DestinationAnyShard()`,
+		`ExecuteStandalone dummy_generate n: type:INT64 value:"2"  ks2 0`,
+		// Fill those values into the insert.
+		`ResolveDestinations ks [] Destinations:DestinationAllShards()`,
+		`ExecuteMultiShard ks.0: dummy_insert {__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"4" __seq2: type:INT64 value:"2" __seq3: type:INT64 value:"5" __seq4: type:INT64 value:"3" } true true`,
+	})
+
+	// The insert id returned by ExecuteMultiShard should be overwritten by processGenerate.
+	expectResult(t, "Execute", result, &sqltypes.Result{InsertID: 4})
+}
+
+func TestInsertUnshardedGenerate_Zeros(t *testing.T) {
+	ins := NewQueryInsert(
+		InsertUnsharded,
+		&vindexes.Keyspace{
+			Name:    "ks",
+			Sharded: false,
+		},
+		"dummy_insert",
+	)
+	ins.Generate = &Generate{
+		Keyspace: &vindexes.Keyspace{
+			Name:    "ks2",
+			Sharded: false,
+		},
+		Query: "dummy_generate",
+		Values: sqltypes.PlanValue{
+			Values: []sqltypes.PlanValue{
+				{Value: sqltypes.NewInt64(1)},
+				{Value: sqltypes.NewInt64(0)},
+				{Value: sqltypes.NewInt64(2)},
+				{Value: sqltypes.NewInt64(0)},
 				{Value: sqltypes.NewInt64(3)},
 			},
 		},
@@ -313,7 +370,7 @@ func TestInsertShardedFail(t *testing.T) {
 
 	// The lookup will fail to map to a keyspace id.
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: could not map [INT64(1)] to a keyspace id")
+	require.EqualError(t, err, `could not map [INT64(1)] to a keyspace id`)
 }
 
 func TestInsertShardedGenerate(t *testing.T) {
@@ -855,6 +912,15 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 		" suffix",
 	)
 
+	ksid0Lookup := sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields(
+			"from|to",
+			"int64|varbinary",
+		),
+		"1|\x00",
+		"3|\x00",
+		"4|\x00",
+	)
 	ksid0 := sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"to",
@@ -867,10 +933,7 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 	vc.shardForKsid = []string{"20-", "-20"}
 	vc.results = []*sqltypes.Result{
 		// primary vindex lookups: fail row 2.
-		ksid0,
-		noresult,
-		ksid0,
-		ksid0,
+		ksid0Lookup,
 		// insert lkp2
 		noresult,
 		// fail one verification (row 3)
@@ -889,10 +952,7 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"1"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"2"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"3"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"4"  false`,
+		`Execute select from1, toc from prim where from1 in ::from1 from1: type:TUPLE values:<type:INT64 value:"1" > values:<type:INT64 value:"2" > values:<type:INT64 value:"3" > values:<type:INT64 value:"4" >  false`,
 		`Execute insert ignore into lkp2(from1, from2, toc) values(:from1_0, :from2_0, :toc_0), (:from1_1, :from2_1, :toc_1), (:from1_2, :from2_2, :toc_2) ` +
 			`from1_0: type:INT64 value:"5" from1_1: type:INT64 value:"7" from1_2: type:INT64 value:"8" ` +
 			`from2_0: type:INT64 value:"9" from2_1: type:INT64 value:"11" from2_2: type:INT64 value:"12" ` +
@@ -1351,7 +1411,7 @@ func TestInsertShardedIgnoreUnownedVerifyFail(t *testing.T) {
 	vc := newDMLTestVCursor("-20", "20-")
 
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: values [[INT64(2)]] for column [c3] does not map to keyspace ids")
+	require.EqualError(t, err, `values [[INT64(2)]] for column [c3] does not map to keyspace ids`)
 }
 
 func TestInsertShardedUnownedReverseMap(t *testing.T) {
@@ -1561,5 +1621,5 @@ func TestInsertShardedUnownedReverseMapFail(t *testing.T) {
 	vc := newDMLTestVCursor("-20", "20-")
 
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: value must be supplied for column [c3]")
+	require.EqualError(t, err, `value must be supplied for column [c3]`)
 }

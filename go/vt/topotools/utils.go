@@ -21,7 +21,7 @@ import (
 	"sort"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
@@ -68,6 +68,20 @@ func GetAllTablets(ctx context.Context, ts *topo.Server, cell string) ([]*topo.T
 	return tablets, nil
 }
 
+// GetTabletMapForCell returns a map of TabletInfo keyed by alias as string
+func GetTabletMapForCell(ctx context.Context, ts *topo.Server, cell string) (map[string]*topo.TabletInfo, error) {
+	aliases, err := ts.GetTabletsByCell(ctx, cell)
+	if err != nil {
+		return nil, err
+	}
+	tabletMap, err := ts.GetTabletMap(ctx, aliases)
+	if err != nil {
+		// we got another error than topo.ErrNoNode
+		return nil, err
+	}
+	return tabletMap, nil
+}
+
 // GetAllTabletsAcrossCells returns all tablets from known cells.
 // If it returns topo.ErrPartialResult, then the list is valid, but partial.
 func GetAllTabletsAcrossCells(ctx context.Context, ts *topo.Server) ([]*topo.TabletInfo, error) {
@@ -101,22 +115,22 @@ func GetAllTabletsAcrossCells(ctx context.Context, ts *topo.Server) ([]*topo.Tab
 }
 
 // SortedTabletMap returns two maps:
-// - The slaveMap contains all the non-master non-scrapped hosts.
-//   This can be used as a list of slaves to fix up for reparenting
+// - The replicaMap contains all the non-master non-scrapped hosts.
+//   This can be used as a list of replicas to fix up for reparenting
 // - The masterMap contains all the tablets without parents
 //   (scrapped or not). This can be used to special case
 //   the old master, and any tablet in a weird state, left over, ...
 func SortedTabletMap(tabletMap map[string]*topo.TabletInfo) (map[string]*topo.TabletInfo, map[string]*topo.TabletInfo) {
-	slaveMap := make(map[string]*topo.TabletInfo)
+	replicaMap := make(map[string]*topo.TabletInfo)
 	masterMap := make(map[string]*topo.TabletInfo)
 	for alias, ti := range tabletMap {
 		if ti.Type == topodatapb.TabletType_MASTER {
 			masterMap[alias] = ti
 		} else {
-			slaveMap[alias] = ti
+			replicaMap[alias] = ti
 		}
 	}
-	return slaveMap, masterMap
+	return replicaMap, masterMap
 }
 
 // CopyMapKeys copies keys from map m into a new slice with the

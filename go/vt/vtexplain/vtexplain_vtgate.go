@@ -20,9 +20,13 @@ limitations under the License.
 package vtexplain
 
 import (
+	"context"
 	"fmt"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/cache"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/json2"
@@ -42,7 +46,7 @@ import (
 var (
 	explainTopo    *ExplainTopo
 	vtgateExecutor *vtgate.Executor
-	healthCheck    *discovery.FakeLegacyHealthCheck
+	healthCheck    *discovery.FakeHealthCheck
 
 	vtgateSession = &vtgatepb.Session{
 		TargetString: "",
@@ -50,13 +54,14 @@ var (
 	}
 )
 
-func initVtgateExecutor(vSchemaStr string, opts *Options) error {
+func initVtgateExecutor(vSchemaStr, ksShardMapStr string, opts *Options) error {
 	explainTopo = &ExplainTopo{NumShards: opts.NumShards}
-	healthCheck = discovery.NewFakeLegacyHealthCheck()
+	explainTopo.TopoServer = memorytopo.NewServer(vtexplainCell)
+	healthCheck = discovery.NewFakeHealthCheck()
 
-	resolver := newFakeResolver(opts, healthCheck, explainTopo, vtexplainCell)
+	resolver := newFakeResolver(opts, explainTopo, vtexplainCell)
 
-	err := buildTopology(opts, vSchemaStr, opts.NumShards)
+	err := buildTopology(opts, vSchemaStr, ksShardMapStr, opts.NumShards)
 	if err != nil {
 		return err
 	}
@@ -64,30 +69,27 @@ func initVtgateExecutor(vSchemaStr string, opts *Options) error {
 	vtgateSession.TargetString = opts.Target
 
 	streamSize := 10
-	queryPlanCacheSize := int64(10)
-	vtgateExecutor = vtgate.NewExecutor(context.Background(), explainTopo, vtexplainCell, resolver, opts.Normalize, streamSize, queryPlanCacheSize)
+	vtgateExecutor = vtgate.NewExecutor(context.Background(), explainTopo, vtexplainCell, resolver, opts.Normalize, false /*do not warn for sharded only*/, streamSize, cache.DefaultConfig)
 
 	return nil
 }
 
-func newFakeResolver(opts *Options, hc discovery.LegacyHealthCheck, serv srvtopo.Server, cell string) *vtgate.Resolver {
+func newFakeResolver(opts *Options, serv srvtopo.Server, cell string) *vtgate.Resolver {
 	ctx := context.Background()
-	// change this back after fixing vtexplain to work with new healthcheck
-	// gw := vtgate.GatewayCreator()(ctx, hc, serv, cell, 3)
-	gw := vtgate.NewDiscoveryGateway(ctx, hc, serv, cell, 3)
-	gw.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_REPLICA})
+	gw := vtgate.NewTabletGateway(ctx, healthCheck, serv, cell)
+	_ = gw.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_REPLICA})
 
 	txMode := vtgatepb.TransactionMode_MULTI
 	if opts.ExecutionMode == ModeTwoPC {
 		txMode = vtgatepb.TransactionMode_TWOPC
 	}
 	tc := vtgate.NewTxConn(gw, txMode)
-	sc := vtgate.NewLegacyScatterConn("", tc, gw, hc)
+	sc := vtgate.NewScatterConn("", tc, gw)
 	srvResolver := srvtopo.NewResolver(serv, gw, cell)
 	return vtgate.NewResolver(srvResolver, serv, cell, sc)
 }
 
-func buildTopology(opts *Options, vschemaStr string, numShardsPerKeyspace int) error {
+func buildTopology(opts *Options, vschemaStr string, ksShardMapStr string, numShardsPerKeyspace int) error {
 	explainTopo.Lock.Lock()
 	defer explainTopo.Lock.Unlock()
 
@@ -101,29 +103,84 @@ func buildTopology(opts *Options, vschemaStr string, numShardsPerKeyspace int) e
 	}
 	explainTopo.Keyspaces = srvVSchema.Keyspaces
 
-	explainTopo.TabletConns = make(map[string]*explainTablet)
-	for ks, vschema := range explainTopo.Keyspaces {
-		numShards := 1
-		if vschema.Sharded {
-			numShards = numShardsPerKeyspace
-		}
-		for i := 0; i < numShards; i++ {
-			kr, err := key.EvenShardsKeyRange(i, numShards)
-			if err != nil {
-				return err
-			}
-			shard := key.KeyRangeString(kr)
-			hostname := fmt.Sprintf("%s/%s", ks, shard)
-			log.Infof("registering test tablet %s for keyspace %s shard %s", hostname, ks, shard)
+	ksShardMap, err := getKeyspaceShardMap(ksShardMapStr)
+	if err != nil {
+		return err
+	}
 
-			tablet := healthCheck.AddFakeTablet(vtexplainCell, hostname, 1, ks, shard, topodatapb.TabletType_MASTER, true, 1, nil, func(t *topodatapb.Tablet) queryservice.QueryService {
+	explainTopo.TabletConns = make(map[string]*explainTablet)
+	explainTopo.KeyspaceShards = make(map[string]map[string]*topodatapb.ShardReference)
+	for ks, vschema := range explainTopo.Keyspaces {
+		shards, err := getShardRanges(ks, vschema, ksShardMap, numShardsPerKeyspace)
+		if err != nil {
+			return err
+		}
+
+		explainTopo.KeyspaceShards[ks] = make(map[string]*topodatapb.ShardReference)
+
+		for _, shard := range shards {
+			hostname := fmt.Sprintf("%s/%s", ks, shard.Name)
+			log.Infof("registering test tablet %s for keyspace %s shard %s", hostname, ks, shard.Name)
+
+			tablet := healthCheck.AddFakeTablet(vtexplainCell, hostname, 1, ks, shard.Name, topodatapb.TabletType_MASTER, true, 1, nil, func(t *topodatapb.Tablet) queryservice.QueryService {
 				return newTablet(opts, t)
 			})
 			explainTopo.TabletConns[hostname] = tablet.(*explainTablet)
+			explainTopo.KeyspaceShards[ks][shard.Name] = shard
 		}
 	}
 
 	return err
+}
+
+func getKeyspaceShardMap(ksShardMapStr string) (map[string]map[string]*topo.ShardInfo, error) {
+	if ksShardMapStr == "" {
+		return map[string]map[string]*topo.ShardInfo{}, nil
+	}
+
+	// keyspace-name -> shard-name -> ShardInfo
+	var ksShardMap map[string]map[string]*topo.ShardInfo
+	err := json2.Unmarshal([]byte(ksShardMapStr), &ksShardMap)
+
+	return ksShardMap, err
+}
+
+func getShardRanges(ks string, vschema *vschemapb.Keyspace, ksShardMap map[string]map[string]*topo.ShardInfo, numShardsPerKeyspace int) ([]*topodatapb.ShardReference, error) {
+	shardMap, ok := ksShardMap[ks]
+	if ok {
+		shards := make([]*topodatapb.ShardReference, 0, len(shardMap))
+		for shard, info := range shardMap {
+			ref := &topodatapb.ShardReference{
+				Name:     shard,
+				KeyRange: info.KeyRange,
+			}
+
+			shards = append(shards, ref)
+		}
+		return shards, nil
+
+	}
+
+	numShards := 1
+	if vschema.Sharded {
+		numShards = numShardsPerKeyspace
+	}
+
+	shards := make([]*topodatapb.ShardReference, numShards)
+
+	for i := 0; i < numShards; i++ {
+		kr, err := key.EvenShardsKeyRange(i, numShards)
+		if err != nil {
+			return nil, err
+		}
+
+		shards[i] = &topodatapb.ShardReference{
+			Name:     key.KeyRangeString(kr),
+			KeyRange: kr,
+		}
+	}
+
+	return shards, nil
 }
 
 func vtgateExecute(sql string) ([]*engine.Plan, map[string]*TabletActions, error) {
@@ -143,11 +200,12 @@ func vtgateExecute(sql string) ([]*engine.Plan, map[string]*TabletActions, error
 	}
 
 	var plans []*engine.Plan
-	for _, item := range planCache.Items() {
-		plan := item.Value.(*engine.Plan)
+	planCache.ForEach(func(value interface{}) bool {
+		plan := value.(*engine.Plan)
 		plan.ExecTime = 0
 		plans = append(plans, plan)
-	}
+		return true
+	})
 	planCache.Clear()
 
 	tabletActions := make(map[string]*TabletActions)

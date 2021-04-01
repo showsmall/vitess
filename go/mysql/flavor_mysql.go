@@ -21,7 +21,7 @@ import (
 	"io"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -29,10 +29,24 @@ import (
 
 // mysqlFlavor implements the Flavor interface for Mysql.
 type mysqlFlavor struct{}
+type mysqlFlavor56 struct {
+	mysqlFlavor
+}
+type mysqlFlavor57 struct {
+	mysqlFlavor
+}
+type mysqlFlavor80 struct {
+	mysqlFlavor
+}
+
+var _ flavor = (*mysqlFlavor56)(nil)
+var _ flavor = (*mysqlFlavor57)(nil)
+var _ flavor = (*mysqlFlavor80)(nil)
 
 // masterGTIDSet is part of the Flavor interface.
 func (mysqlFlavor) masterGTIDSet(c *Conn) (GTIDSet, error) {
-	qr, err := c.ExecuteFetch("SELECT @@GLOBAL.gtid_executed", 1, false)
+	// keep @@global as lowercase, as some servers like the Ripple binlog server only honors a lowercase `global` value
+	qr, err := c.ExecuteFetch("SELECT @@global.gtid_executed", 1, false)
 	if err != nil {
 		return nil, err
 	}
@@ -42,11 +56,11 @@ func (mysqlFlavor) masterGTIDSet(c *Conn) (GTIDSet, error) {
 	return parseMysql56GTIDSet(qr.Rows[0][0].ToString())
 }
 
-func (mysqlFlavor) startSlaveCommand() string {
+func (mysqlFlavor) startReplicationCommand() string {
 	return "START SLAVE"
 }
 
-func (mysqlFlavor) restartSlaveCommands() []string {
+func (mysqlFlavor) restartReplicationCommands() []string {
 	return []string{
 		"STOP SLAVE",
 		"RESET SLAVE",
@@ -54,16 +68,20 @@ func (mysqlFlavor) restartSlaveCommands() []string {
 	}
 }
 
-func (mysqlFlavor) startSlaveUntilAfter(pos Position) string {
+func (mysqlFlavor) startReplicationUntilAfter(pos Position) string {
 	return fmt.Sprintf("START SLAVE UNTIL SQL_AFTER_GTIDS = '%s'", pos)
 }
 
-func (mysqlFlavor) stopSlaveCommand() string {
+func (mysqlFlavor) stopReplicationCommand() string {
 	return "STOP SLAVE"
 }
 
+func (mysqlFlavor) stopIOThreadCommand() string {
+	return "STOP SLAVE IO_THREAD"
+}
+
 // sendBinlogDumpCommand is part of the Flavor interface.
-func (mysqlFlavor) sendBinlogDumpCommand(c *Conn, slaveID uint32, startPos Position) error {
+func (mysqlFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error {
 	gtidSet, ok := startPos.GTIDSet.(Mysql56GTIDSet)
 	if !ok {
 		return vterrors.Errorf(vtrpc.Code_INTERNAL, "startPos.GTIDSet is wrong type - expected Mysql56GTIDSet, got: %#v", startPos.GTIDSet)
@@ -71,7 +89,7 @@ func (mysqlFlavor) sendBinlogDumpCommand(c *Conn, slaveID uint32, startPos Posit
 
 	// Build the command.
 	sidBlock := gtidSet.SIDBlock()
-	return c.WriteComBinlogDumpGTID(slaveID, "", 4, 0, sidBlock)
+	return c.WriteComBinlogDumpGTID(serverID, "", 4, 0, sidBlock)
 }
 
 // resetReplicationCommands is part of the Flavor interface.
@@ -82,51 +100,51 @@ func (mysqlFlavor) resetReplicationCommands(c *Conn) []string {
 		"RESET MASTER",    // This will also clear gtid_executed and gtid_purged.
 	}
 	if c.SemiSyncExtensionLoaded() {
-		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_master_enabled = false, GLOBAL rpl_semi_sync_slave_enabled = false") // semi-sync will be enabled if needed when slave is started.
+		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_master_enabled = false, GLOBAL rpl_semi_sync_slave_enabled = false") // semi-sync will be enabled if needed when replica is started.
 	}
 	return resetCommands
 }
 
-// setSlavePositionCommands is part of the Flavor interface.
-func (mysqlFlavor) setSlavePositionCommands(pos Position) []string {
+// setReplicationPositionCommands is part of the Flavor interface.
+func (mysqlFlavor) setReplicationPositionCommands(pos Position) []string {
 	return []string{
 		"RESET MASTER", // We must clear gtid_executed before setting gtid_purged.
 		fmt.Sprintf("SET GLOBAL gtid_purged = '%s'", pos),
 	}
 }
 
-// setSlavePositionCommands is part of the Flavor interface.
+// setReplicationPositionCommands is part of the Flavor interface.
 func (mysqlFlavor) changeMasterArg() string {
 	return "MASTER_AUTO_POSITION = 1"
 }
 
 // status is part of the Flavor interface.
-func (mysqlFlavor) status(c *Conn) (SlaveStatus, error) {
+func (mysqlFlavor) status(c *Conn) (ReplicationStatus, error) {
 	qr, err := c.ExecuteFetch("SHOW SLAVE STATUS", 100, true /* wantfields */)
 	if err != nil {
-		return SlaveStatus{}, err
+		return ReplicationStatus{}, err
 	}
 	if len(qr.Rows) == 0 {
 		// The query returned no data, meaning the server
-		// is not configured as a slave.
-		return SlaveStatus{}, ErrNotSlave
+		// is not configured as a replica.
+		return ReplicationStatus{}, ErrNotReplica
 	}
 
 	resultMap, err := resultToMap(qr)
 	if err != nil {
-		return SlaveStatus{}, err
+		return ReplicationStatus{}, err
 	}
 
-	return parseMysqlSlaveStatus(resultMap)
+	return parseMysqlReplicationStatus(resultMap)
 }
 
-func parseMysqlSlaveStatus(resultMap map[string]string) (SlaveStatus, error) {
-	status := parseSlaveStatus(resultMap)
+func parseMysqlReplicationStatus(resultMap map[string]string) (ReplicationStatus, error) {
+	status := parseReplicationStatus(resultMap)
 	uuidString := resultMap["Master_UUID"]
 	if uuidString != "" {
 		sid, err := ParseSID(uuidString)
 		if err != nil {
-			return SlaveStatus{}, vterrors.Wrapf(err, "cannot decode MasterUUID")
+			return ReplicationStatus{}, vterrors.Wrapf(err, "cannot decode MasterUUID")
 		}
 		status.MasterUUID = sid
 	}
@@ -134,11 +152,11 @@ func parseMysqlSlaveStatus(resultMap map[string]string) (SlaveStatus, error) {
 	var err error
 	status.Position.GTIDSet, err = parseMysql56GTIDSet(resultMap["Executed_Gtid_Set"])
 	if err != nil {
-		return SlaveStatus{}, vterrors.Wrapf(err, "SlaveStatus can't parse MySQL 5.6 GTID (Executed_Gtid_Set: %#v)", resultMap["Executed_Gtid_Set"])
+		return ReplicationStatus{}, vterrors.Wrapf(err, "ReplicationStatus can't parse MySQL 5.6 GTID (Executed_Gtid_Set: %#v)", resultMap["Executed_Gtid_Set"])
 	}
 	relayLogGTIDSet, err := parseMysql56GTIDSet(resultMap["Retrieved_Gtid_Set"])
 	if err != nil {
-		return SlaveStatus{}, vterrors.Wrapf(err, "SlaveStatus can't parse MySQL 5.6 GTID (Retrieved_Gtid_Set: %#v)", resultMap["Retrieved_Gtid_Set"])
+		return ReplicationStatus{}, vterrors.Wrapf(err, "ReplicationStatus can't parse MySQL 5.6 GTID (Retrieved_Gtid_Set: %#v)", resultMap["Retrieved_Gtid_Set"])
 	}
 	// We take the union of the executed and retrieved gtidset, because the retrieved gtidset only represents GTIDs since
 	// the relay log has been reset. To get the full Position, we need to take a union of executed GTIDSets, since these would
@@ -147,6 +165,39 @@ func parseMysqlSlaveStatus(resultMap map[string]string) (SlaveStatus, error) {
 
 	return status, nil
 }
+
+// masterStatus is part of the Flavor interface.
+func (mysqlFlavor) masterStatus(c *Conn) (MasterStatus, error) {
+	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
+	if err != nil {
+		return MasterStatus{}, err
+	}
+	if len(qr.Rows) == 0 {
+		// The query returned no data. We don't know how this could happen.
+		return MasterStatus{}, ErrNoMasterStatus
+	}
+
+	resultMap, err := resultToMap(qr)
+	if err != nil {
+		return MasterStatus{}, err
+	}
+
+	return parseMysqlMasterStatus(resultMap)
+}
+
+func parseMysqlMasterStatus(resultMap map[string]string) (MasterStatus, error) {
+	status := parseMasterStatus(resultMap)
+
+	var err error
+	status.Position.GTIDSet, err = parseMysql56GTIDSet(resultMap["Executed_Gtid_Set"])
+	if err != nil {
+		return MasterStatus{}, vterrors.Wrapf(err, "MasterStatus can't parse MySQL 5.6 GTID (Executed_Gtid_Set: %#v)", resultMap["Executed_Gtid_Set"])
+	}
+
+	return status, nil
+}
+
+// waitUntilPositionCommand is part of the Flavor interface.
 
 // waitUntilPositionCommand is part of the Flavor interface.
 func (mysqlFlavor) waitUntilPositionCommand(ctx context.Context, pos Position) (string, error) {
@@ -192,4 +243,41 @@ func (mysqlFlavor) enableBinlogPlaybackCommand() string {
 // disableBinlogPlaybackCommand is part of the Flavor interface.
 func (mysqlFlavor) disableBinlogPlaybackCommand() string {
 	return ""
+}
+
+// TablesWithSize56 is a query to select table along with size for mysql 5.6
+const TablesWithSize56 = `SELECT table_name, table_type, unix_timestamp(create_time), table_comment, SUM( data_length + index_length), SUM( data_length + index_length) 
+		FROM information_schema.tables WHERE table_schema = database() group by table_name`
+
+// TablesWithSize57 is a query to select table along with size for mysql 5.7.
+// It's a little weird, because the JOIN predicate only works if the table and databases do not contain weird characters.
+// As a fallback, we use the mysql 5.6 query, which is not always up to date, but works for all table/db names.
+const TablesWithSize57 = `SELECT t.table_name, t.table_type, unix_timestamp(t.create_time), t.table_comment, i.file_size, i.allocated_size 
+	FROM information_schema.tables t, information_schema.innodb_sys_tablespaces i 
+	WHERE t.table_schema = database() and i.name = concat(t.table_schema,'/',t.table_name)
+UNION ALL
+	SELECT table_name, table_type, unix_timestamp(create_time), table_comment, SUM( data_length + index_length), SUM( data_length + index_length)
+	FROM information_schema.tables t
+	WHERE table_schema = database() AND NOT EXISTS(SELECT * FROM information_schema.innodb_sys_tablespaces i WHERE i.name = concat(t.table_schema,'/',t.table_name)) 
+	group by table_name, table_type, unix_timestamp(create_time), table_comment
+`
+
+// TablesWithSize80 is a query to select table along with size for mysql 8.0
+const TablesWithSize80 = `SELECT t.table_name, t.table_type, unix_timestamp(t.create_time), t.table_comment, i.file_size, i.allocated_size 
+		FROM information_schema.tables t, information_schema.innodb_tablespaces i 
+		WHERE t.table_schema = database() and i.name = concat(t.table_schema,'/',t.table_name)`
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mysqlFlavor56) baseShowTablesWithSizes() string {
+	return TablesWithSize56
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mysqlFlavor57) baseShowTablesWithSizes() string {
+	return TablesWithSize57
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mysqlFlavor80) baseShowTablesWithSizes() string {
+	return TablesWithSize80
 }

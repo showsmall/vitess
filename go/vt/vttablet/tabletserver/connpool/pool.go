@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/pools"
 	"vitess.io/vitess/go/sync2"
@@ -62,13 +62,13 @@ type Pool struct {
 // NewPool creates a new Pool. The name is used
 // to publish stats only.
 func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
-	idleTimeout := time.Duration(cfg.IdleTimeoutSeconds * 1e9)
+	idleTimeout := cfg.IdleTimeoutSeconds.Get()
 	cp := &Pool{
 		env:                env,
 		name:               name,
 		capacity:           cfg.Size,
 		prefillParallelism: cfg.PrefillParallelism,
-		timeout:            time.Duration(cfg.TimeoutSeconds * 1e9),
+		timeout:            cfg.TimeoutSeconds.Get(),
 		idleTimeout:        idleTimeout,
 		waiterCap:          int64(cfg.MaxWaiters),
 		dbaPool:            dbconnpool.NewConnectionPool("", 1, idleTimeout, 0),

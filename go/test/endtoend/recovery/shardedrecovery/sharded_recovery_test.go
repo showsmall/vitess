@@ -28,6 +28,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	_ "vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
@@ -107,9 +108,9 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 	defer cluster.PanicHandler(t)
 	_, err := initializeCluster(t)
 	defer localCluster.Teardown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = localCluster.VtctlclientProcess.ApplySchema(keyspaceName, vtInsertTest)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	recovery.InsertData(t, master, 1, keyspaceName)
 	cluster.VerifyRowsInTablet(t, replica1, keyspaceName, 1)
 
@@ -118,11 +119,11 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 
 	// backup the replica
 	err = localCluster.VtctlclientProcess.ExecuteCommand("Backup", replica1.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// check that the backup shows up in the listing
 	output, err := localCluster.ListBackups("test_keyspace/0")
-	require.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, len(output))
 	assert.True(t, strings.HasSuffix(output[0], replica1.Alias))
 
@@ -130,36 +131,26 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 	recovery.InsertData(t, master, 3, keyspaceName)
 
 	err = localCluster.VtctlclientProcess.ApplyVSchema(keyspaceName, vSchema)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// create the split shards
-	for _, tablet := range []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly} {
-		err = localCluster.VtctlclientProcess.InitTablet(tablet, cell, keyspaceName, hostname, shard0Name)
-		require.Nil(t, err)
-	}
-
-	for _, tablet := range []*cluster.Vttablet{shard1Master, shard1Replica, shard1RdOnly} {
-		err = localCluster.VtctlclientProcess.InitTablet(tablet, cell, keyspaceName, hostname, shard1Name)
-		require.Nil(t, err)
-	}
-
 	for _, tablet := range []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly, shard1Master, shard1Replica, shard1RdOnly} {
 		tablet.VttabletProcess.ExtraArgs = []string{"-binlog_use_v3_resharding_mode=true"}
 		err = tablet.VttabletProcess.Setup()
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	err = localCluster.VtctlProcess.ExecuteCommand("InitShardMaster", "-force", "test_keyspace/-80", shard0Master.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlProcess.ExecuteCommand("InitShardMaster", "-force", "test_keyspace/80-", shard1Master.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	shardedTablets := []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly, shard1Master, shard1Replica, shard1RdOnly}
 
 	for _, tablet := range shardedTablets {
 		_ = tablet.VttabletProcess.WaitForTabletType("SERVING")
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	for _, tablet := range shardedTablets {
@@ -169,39 +160,39 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 	// we need to create the schema, and the worker will do data copying
 	for _, keyspaceShard := range []string{"test_keyspace/-80", "test_keyspace/80-"} {
 		err = localCluster.VtctlclientProcess.ExecuteCommand("CopySchemaShard", "test_keyspace/0", keyspaceShard)
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("SplitClone", "test_keyspace", "0", "-80,80-")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "rdonly")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "replica")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// then serve master from the split shards
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "master")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// remove the original tablets in the original shard
 	removeTablets(t, []*cluster.Vttablet{master, replica1, rdOnly})
 
 	for _, tablet := range []*cluster.Vttablet{replica1, rdOnly} {
 		err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteTablet", tablet.Alias)
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 	err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteTablet", "-allow_master", master.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// rebuild the serving graph, all mentions of the old shards should be gone
 	err = localCluster.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", "test_keyspace")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// delete the original shard
 	err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteShard", "test_keyspace/0")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// now bring up the recovery keyspace and a tablet, letting it restore from backup.
 	recovery.RestoreTablet(t, localCluster, replica2, recoveryKS, "0", keyspaceName, commonTabletArg)
@@ -213,23 +204,23 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 	vtgateInstance.TabletTypesToWait = "REPLICA"
 	err = vtgateInstance.Setup()
 	localCluster.VtgateGrpcPort = vtgateInstance.GrpcPort
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", recoveryKS, shardName), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// Build vtgate grpc connection
 	// check that vtgate doesn't route queries to new tablet
 	grpcAddress := fmt.Sprintf("%s:%d", localCluster.Hostname, localCluster.VtgateGrpcPort)
 	vtgateConn, err := vtgateconn.Dial(context.Background(), grpcAddress)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	session := vtgateConn.Session("@replica", nil)
 	recovery.VerifyQueriesUsingVtgate(t, session, "select count(*) from vt_insert_test", "INT64(3)")
@@ -247,7 +238,7 @@ func TestUnShardedRecoveryAfterSharding(t *testing.T) {
 
 	vtgateConn.Close()
 	err = vtgateInstance.TearDown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 }
 
 // Test recovery from backup flow.
@@ -269,9 +260,9 @@ func TestShardedRecovery(t *testing.T) {
 	defer cluster.PanicHandler(t)
 	_, err := initializeCluster(t)
 	defer localCluster.Teardown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = localCluster.VtctlclientProcess.ApplySchema(keyspaceName, vtInsertTest)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	recovery.InsertData(t, master, 1, keyspaceName)
 
 	cluster.VerifyRowsInTablet(t, replica1, keyspaceName, 1)
@@ -280,119 +271,104 @@ func TestShardedRecovery(t *testing.T) {
 	recovery.InsertData(t, master, 4, keyspaceName)
 
 	err = localCluster.VtctlclientProcess.ApplyVSchema(keyspaceName, vSchema)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// create the split shards
-	for _, tablet := range []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly} {
-		err = localCluster.VtctlclientProcess.InitTablet(tablet, cell, keyspaceName, hostname, shard0Name)
-		require.Nil(t, err)
-	}
-
-	for _, tablet := range []*cluster.Vttablet{shard1Master, shard1Replica, shard1RdOnly} {
-		err = localCluster.VtctlclientProcess.InitTablet(tablet, cell, keyspaceName, hostname, shard1Name)
-		require.Nil(t, err)
-	}
-
-	for _, tablet := range []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly, shard1Master, shard1Replica, shard1RdOnly} {
+	shardedTablets := []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly, shard1Master, shard1Replica, shard1RdOnly}
+	for _, tablet := range shardedTablets {
 		tablet.VttabletProcess.ExtraArgs = []string{"-binlog_use_v3_resharding_mode=true"}
 		err = tablet.VttabletProcess.Setup()
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	err = localCluster.VtctlProcess.ExecuteCommand("InitShardMaster", "-force", "test_keyspace/-80", shard0Master.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlProcess.ExecuteCommand("InitShardMaster", "-force", "test_keyspace/80-", shard1Master.Alias)
-	require.Nil(t, err)
-
-	shardedTablets := []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly, shard1Master, shard1Replica, shard1RdOnly}
+	require.NoError(t, err)
 
 	for _, tablet := range shardedTablets {
 		_ = tablet.VttabletProcess.WaitForTabletType("SERVING")
-		require.Nil(t, err)
-	}
-
-	for _, tablet := range shardedTablets {
-		assert.Equal(t, tablet.VttabletProcess.GetTabletStatus(), "SERVING")
+		require.NoError(t, err)
 	}
 
 	// we need to create the schema, and the worker will do data copying
 	for _, keyspaceShard := range []string{"test_keyspace/-80", "test_keyspace/80-"} {
 		err = localCluster.VtctlclientProcess.ExecuteCommand("CopySchemaShard", "test_keyspace/0", keyspaceShard)
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("SplitClone", "test_keyspace", "0", "-80,80-")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "rdonly")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "replica")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// then serve master from the split shards
 	err = localCluster.VtctlclientProcess.ExecuteCommand("MigrateServedTypes", "test_keyspace/0", "master")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// remove the original tablets in the original shard
 	removeTablets(t, []*cluster.Vttablet{master, replica1, rdOnly})
 
 	for _, tablet := range []*cluster.Vttablet{replica1, rdOnly} {
 		err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteTablet", tablet.Alias)
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 	err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteTablet", "-allow_master", master.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// rebuild the serving graph, all mentions of the old shards should be gone
 	err = localCluster.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", "test_keyspace")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// delete the original shard
 	err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteShard", "test_keyspace/0")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	qr, err := shard0Master.VttabletProcess.QueryTablet("select count(*) from vt_insert_test", keyspaceName, true)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	shard0CountStr := fmt.Sprintf("%s", qr.Rows[0][0].ToBytes())
 	shard0Count, err := strconv.Atoi(shard0CountStr)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	var shard0TestID string
 	if shard0Count > 0 {
 		qr, err := shard0Master.VttabletProcess.QueryTablet("select id from vt_insert_test", keyspaceName, true)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		shard0TestID = fmt.Sprintf("%s", qr.Rows[0][0].ToBytes())
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	qr, err = shard1Master.VttabletProcess.QueryTablet("select count(*) from vt_insert_test", keyspaceName, true)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	shard1CountStr := fmt.Sprintf("%s", qr.Rows[0][0].ToBytes())
 	shard1Count, err := strconv.Atoi(shard1CountStr)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	var shard1TestID string
 	if shard1Count > 0 {
 		qr, err := shard1Master.VttabletProcess.QueryTablet("select id from vt_insert_test", keyspaceName, true)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		shard1TestID = fmt.Sprintf("%s", qr.Rows[0][0].ToBytes())
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 
 	// backup the new shards
 	err = localCluster.VtctlclientProcess.ExecuteCommand("Backup", shard0Replica.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = localCluster.VtctlclientProcess.ExecuteCommand("Backup", shard1Replica.Alias)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// check that the backup shows up in the listing
 	output, err := localCluster.ListBackups("test_keyspace/-80")
-	require.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, len(output))
 	assert.True(t, strings.HasSuffix(output[0], shard0Replica.Alias))
 
 	output, err = localCluster.ListBackups("test_keyspace/80-")
-	require.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, len(output))
 	assert.True(t, strings.HasSuffix(output[0], shard1Replica.Alias))
 
@@ -400,24 +376,24 @@ func TestShardedRecovery(t *testing.T) {
 	vtgateInstance.TabletTypesToWait = "MASTER"
 	err = vtgateInstance.Setup()
 	localCluster.VtgateGrpcPort = vtgateInstance.GrpcPort
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// Build vtgate grpc connection
 	// check that vtgate doesn't route queries to new tablet
 	grpcAddress := fmt.Sprintf("%s:%d", localCluster.Hostname, localCluster.VtgateGrpcPort)
 	vtgateConn, err := vtgateconn.Dial(context.Background(), grpcAddress)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	session := vtgateConn.Session("@master", nil)
 	cluster.ExecuteQueriesUsingVtgate(t, session, "insert into vt_insert_test (id, msg) values (2,'test 2')")
 	cluster.ExecuteQueriesUsingVtgate(t, session, "insert into vt_insert_test (id, msg) values (3,'test 3')")
 
 	vtgateConn.Close()
 	err = vtgateInstance.TearDown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// now bring up the recovery keyspace and 2 tablets, letting it restore from backup.
 	recovery.RestoreTablet(t, localCluster, replica2, recoveryKS, "-80", keyspaceName, commonTabletArg)
@@ -432,24 +408,24 @@ func TestShardedRecovery(t *testing.T) {
 	vtgateInstance.TabletTypesToWait = "REPLICA"
 	err = vtgateInstance.Setup()
 	localCluster.VtgateGrpcPort = vtgateInstance.GrpcPort
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.master", keyspaceName, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", recoveryKS, shard0Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", recoveryKS, shard1Name), 1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// check that vtgate doesn't route queries to new tablet
 	grpcAddress = fmt.Sprintf("%s:%d", localCluster.Hostname, localCluster.VtgateGrpcPort)
 	vtgateConn, err = vtgateconn.Dial(context.Background(), grpcAddress)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	session = vtgateConn.Session("@replica", nil)
 	recovery.VerifyQueriesUsingVtgate(t, session, "select count(*) from vt_insert_test", "INT64(4)")
 
@@ -471,7 +447,7 @@ func TestShardedRecovery(t *testing.T) {
 
 	vtgateConn.Close()
 	err = vtgateInstance.TearDown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 }
 
 func removeTablets(t *testing.T, tablets []*cluster.Vttablet) {
@@ -483,7 +459,7 @@ func removeTablets(t *testing.T, tablets []*cluster.Vttablet) {
 	}
 	for _, proc := range mysqlProcs {
 		err := proc.Wait()
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 }
 
@@ -533,7 +509,7 @@ func initializeCluster(t *testing.T) (int, error) {
 	localCluster.VtTabletExtraArgs = append(localCluster.VtTabletExtraArgs, commonTabletArg...)
 	localCluster.VtTabletExtraArgs = append(localCluster.VtTabletExtraArgs, "-restore_from_backup", "-enable_semi_sync")
 
-	err = localCluster.LaunchCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
+	err = localCluster.SetupCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
 	require.NoError(t, err)
 	// Start MySql
 	var mysqlCtlProcessList []*exec.Cmd
@@ -552,16 +528,6 @@ func initializeCluster(t *testing.T) (int, error) {
 		if err := proc.Wait(); err != nil {
 			t.Fatal(err)
 		}
-	}
-
-	if err = localCluster.VtctlclientProcess.InitTablet(master, cell, keyspaceName, hostname, shard.Name); err != nil {
-		return 1, err
-	}
-	if err = localCluster.VtctlclientProcess.InitTablet(replica1, cell, keyspaceName, hostname, shard.Name); err != nil {
-		return 1, err
-	}
-	if err = localCluster.VtctlclientProcess.InitTablet(rdOnly, cell, keyspaceName, hostname, shard.Name); err != nil {
-		return 1, err
 	}
 
 	for _, tablet := range []cluster.Vttablet{*master, *replica1, *rdOnly} {
